@@ -1928,6 +1928,12 @@ class AIAgent:
             max_total_size_mb=checkpoint_max_total_size_mb,
             max_file_size_mb=checkpoint_max_file_size_mb,
         )
+
+        # User-defined hook registry — lazy-loaded on first hook fire so a
+        # malformed hooks.json in some other repo can't break agent init.
+        self._hook_registry = None
+        self._hook_registry_loaded = False
+        self._hook_load_report = None
         
         # SQLite session store (optional -- provided by CLI or gateway)
         self._session_db = session_db
@@ -5760,6 +5766,68 @@ class AIAgent:
                 self.client = None
         except Exception:
             pass
+
+        # 6. Fire SessionEnd hook (best-effort, never blocks shutdown)
+        try:
+            self._fire_hook("SessionEnd")
+        except Exception:
+            pass
+
+    def _get_hook_registry(self):
+        """Lazy-load the user-defined hook registry on first use.
+
+        Failure to load (malformed JSON, missing trust, etc.) leaves
+        an empty registry installed so subsequent calls are no-ops.
+        """
+        if self._hook_registry_loaded:
+            return self._hook_registry
+        self._hook_registry_loaded = True
+        try:
+            from agent.hooks import load_hook_registry
+            registry, report = load_hook_registry()
+            self._hook_registry = registry
+            self._hook_load_report = report
+            if len(registry) > 0:
+                logger.info("Loaded %d user-defined hook(s): %s",
+                            len(registry), registry.summary())
+            for warn in report.warnings():
+                logger.warning("hooks: %s", warn)
+        except Exception as exc:
+            logger.warning("Failed to load user hook registry: %s", exc)
+            try:
+                from agent.hooks import HookRegistry
+                self._hook_registry = HookRegistry.empty()
+            except Exception:
+                self._hook_registry = None
+        return self._hook_registry
+
+    def _fire_hook(self, event: str, **payload):
+        """Fire a hook event.  Returns a HookOutcome; never raises.
+
+        Designed for fire-and-forget call sites — the caller can inspect
+        the returned outcome for ``blocked``, ``transformed_args``, or
+        ``additional_context`` but is not required to.
+        """
+        try:
+            from agent.hooks import HookOutcome, run_hooks
+        except Exception as exc:
+            logger.debug("hooks module unavailable for %s: %s", event, exc)
+            return None
+        try:
+            registry = self._get_hook_registry()
+            if registry is None or not registry.has_any(event):
+                return HookOutcome()
+            return run_hooks(
+                registry,
+                event,
+                session_id=str(getattr(self, "session_id", "") or ""),
+                cwd=os.getcwd(),
+                hermes_version=os.environ.get("HERMES_VERSION", ""),
+                **payload,
+            )
+        except Exception as exc:
+            logger.warning("Failed to fire %s hook: %s", event, exc)
+            return HookOutcome()
 
     def _hydrate_todo_store(self, history: List[Dict[str, Any]]) -> None:
         """
@@ -11891,6 +11959,51 @@ class AIAgent:
                 _should_review_memory = True
                 self._turns_since_memory = 0
 
+        # User-defined UserPromptSubmit hook — fires before the message
+        # hits the transcript or the model.  Exit 2 (block) returns
+        # immediately with a synthetic assistant response so the caller
+        # sees the refusal reason.  additional_context entries are
+        # prepended to the user message inside a <hook-context> envelope
+        # so the model can use them but they're visually distinct.
+        ups_outcome = self._fire_hook(
+            "UserPromptSubmit", user_message=user_message,
+        )
+        if ups_outcome is not None and ups_outcome.blocked:
+            block_reason = ups_outcome.block_reason or "blocked by UserPromptSubmit hook"
+            return {
+                "final_response": f"[Blocked by hook] {block_reason}",
+                "last_reasoning": None,
+                "messages": messages,
+                "api_calls": 0,
+                "completed": False,
+                "turn_exit_reason": "user_prompt_blocked",
+                "partial": False,
+                "interrupted": False,
+                "response_previewed": False,
+                "model": self.model,
+                "provider": self.provider,
+                "base_url": self.base_url,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+                "reasoning_tokens": 0,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "last_prompt_tokens": 0,
+                "estimated_cost_usd": 0.0,
+                "cost_status": "unknown",
+                "cost_source": None,
+                "user_prompt_block": {"reason": block_reason},
+            }
+        if ups_outcome is not None and ups_outcome.additional_context:
+            _ctx_block = "\n".join(ups_outcome.additional_context).strip()
+            if _ctx_block:
+                user_message = (
+                    f"<hook-context>\n{_ctx_block}\n</hook-context>\n\n{user_message}"
+                )
+
         # Add user message
         user_msg = {"role": "user", "content": user_message}
         messages.append(user_msg)
@@ -15537,6 +15650,24 @@ class AIAgent:
             )
         except Exception as exc:
             logger.warning("on_session_end hook failed: %s", exc)
+
+        # User-defined Stop hook — runs after a final non-tool response is
+        # emitted and lets external commands gate completion (e.g. force a
+        # test run before the agent declares "done").  Exit 2 surfaces the
+        # block reason into result["stop_hook_block"] so callers can decide
+        # whether to re-enter the loop with the reason as a follow-up turn.
+        if final_response and not interrupted:
+            stop_outcome = self._fire_hook("Stop", final_response=final_response)
+            if stop_outcome is not None:
+                if stop_outcome.blocked:
+                    result["stop_hook_block"] = {
+                        "reason": stop_outcome.block_reason or "blocked by Stop hook",
+                    }
+                if stop_outcome.additional_context:
+                    result["stop_hook_context"] = list(stop_outcome.additional_context)
+                if stop_outcome.errors:
+                    logger.warning("Stop hook errors: %s",
+                                   "; ".join(stop_outcome.errors))
 
         return result
 
