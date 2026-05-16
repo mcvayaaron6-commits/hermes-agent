@@ -1934,6 +1934,15 @@ class AIAgent:
         self._hook_registry = None
         self._hook_registry_loaded = False
         self._hook_load_report = None
+
+        # Plan Mode state — off by default.  Toggled by the /plan and
+        # /exit-plan slash commands.  When enabled, _invoke_tool refuses
+        # any tool not on the read-only allowlist.
+        try:
+            from agent.plan_mode import PlanModeState
+            self._plan_mode = PlanModeState()
+        except Exception:
+            self._plan_mode = None
         
         # SQLite session store (optional -- provided by CLI or gateway)
         self._session_db = session_db
@@ -10574,6 +10583,18 @@ class AIAgent:
         tools. Used by the concurrent execution path; the sequential path retains
         its own inline invocation for backward-compatible display handling.
         """
+        # Plan Mode gate: refuse any tool not on the read-only allowlist.
+        # Higher priority than the plugin pre-tool-block hook so a /plan
+        # session can't be subverted by an over-permissive plugin.
+        plan_mode = getattr(self, "_plan_mode", None)
+        if plan_mode is not None and plan_mode.enabled and not plan_mode.is_tool_allowed(
+            function_name, args=function_args,
+        ):
+            return json.dumps(
+                {"error": plan_mode.refusal_for(function_name)},
+                ensure_ascii=False,
+            )
+
         # Check plugin hooks for a block directive before executing anything.
         block_message: Optional[str] = None
         if not pre_tool_block_checked:
@@ -10740,21 +10761,34 @@ class AIAgent:
 
             block_result = None
             blocked_by_guardrail = False
-            try:
-                from hermes_cli.plugins import get_pre_tool_call_block_message
-                block_message = get_pre_tool_call_block_message(
-                    function_name, function_args, task_id=effective_task_id or "",
-                )
-            except Exception:
-                block_message = None
 
-            if block_message is not None:
-                block_result = json.dumps({"error": block_message}, ensure_ascii=False)
-            else:
-                guardrail_decision = self._tool_guardrails.before_call(function_name, function_args)
-                if not guardrail_decision.allows_execution:
-                    block_result = self._guardrail_block_result(guardrail_decision)
-                    blocked_by_guardrail = True
+            # Plan Mode gate: refuse mutating tools when /plan is active.
+            # Mirrors the gate inside _invoke_tool so the concurrent
+            # short-circuit path doesn't bypass plan-mode protection.
+            plan_mode = getattr(self, "_plan_mode", None)
+            if (plan_mode is not None and plan_mode.enabled
+                    and not plan_mode.is_tool_allowed(function_name, args=function_args)):
+                block_result = json.dumps(
+                    {"error": plan_mode.refusal_for(function_name)},
+                    ensure_ascii=False,
+                )
+
+            if block_result is None:
+                try:
+                    from hermes_cli.plugins import get_pre_tool_call_block_message
+                    block_message = get_pre_tool_call_block_message(
+                        function_name, function_args, task_id=effective_task_id or "",
+                    )
+                except Exception:
+                    block_message = None
+
+                if block_message is not None:
+                    block_result = json.dumps({"error": block_message}, ensure_ascii=False)
+                else:
+                    guardrail_decision = self._tool_guardrails.before_call(function_name, function_args)
+                    if not guardrail_decision.allows_execution:
+                        block_result = self._guardrail_block_result(guardrail_decision)
+                        blocked_by_guardrail = True
 
             parsed_calls.append((tool_call, function_name, function_args, block_result, blocked_by_guardrail))
 
