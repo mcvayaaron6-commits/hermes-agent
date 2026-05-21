@@ -1943,6 +1943,9 @@ class AIAgent:
             self._plan_mode = PlanModeState()
         except Exception:
             self._plan_mode = None
+
+        # Fired exactly once per agent on the first run_conversation call.
+        self._session_start_fired = False
         
         # SQLite session store (optional -- provided by CLI or gateway)
         self._session_db = session_db
@@ -10560,9 +10563,14 @@ class AIAgent:
 
         New DELEGATE_TASK_SCHEMA fields only need to be added here to reach all
         invocation paths (concurrent, sequential, inline).
+
+        Fires the user-defined ``SubagentStop`` hook after the delegated
+        agent finishes so external observers can post-process the
+        subagent's final response (e.g. archive trajectories, score
+        outputs, gate parent loop on subagent success).
         """
         from tools.delegate_tool import delegate_task as _delegate_task
-        return _delegate_task(
+        result = _delegate_task(
             goal=function_args.get("goal"),
             context=function_args.get("context"),
             toolsets=function_args.get("toolsets"),
@@ -10573,15 +10581,28 @@ class AIAgent:
             role=function_args.get("role"),
             parent_agent=self,
         )
+        try:
+            self._fire_hook(
+                "SubagentStop",
+                agent_name=str(function_args.get("role") or "subagent"),
+                final_response=result if isinstance(result, str) else str(result),
+            )
+        except Exception:
+            pass
+        return result
 
     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,
                      tool_call_id: Optional[str] = None, messages: list = None,
                      pre_tool_block_checked: bool = False) -> str:
-        """Invoke a single tool and return the result string. No display logic.
+        """Invoke a single tool, wrapping the dispatch with user-defined
+        ``PreToolUse`` and ``PostToolUse`` hooks.
 
-        Handles both agent-level tools (todo, memory, etc.) and registry-dispatched
-        tools. Used by the concurrent execution path; the sequential path retains
-        its own inline invocation for backward-compatible display handling.
+        ``PreToolUse`` can block (exit 2 → refusal returned to model) or
+        transform the tool's args (stdout JSON ``decision: "transform"``
+        with new ``args``).  ``PostToolUse`` is fire-and-forget for
+        side-effecting commands (lint, format, scan); any errors it
+        surfaces are logged but do not change the tool result the model
+        sees.
         """
         # Plan Mode gate: refuse any tool not on the read-only allowlist.
         # Higher priority than the plugin pre-tool-block hook so a /plan
@@ -10595,6 +10616,50 @@ class AIAgent:
                 ensure_ascii=False,
             )
 
+        # User-defined PreToolUse hook — fires before plugin block check
+        # and dispatch.  Block short-circuits with the hook's reason.
+        # Transform replaces the args before dispatch.
+        pre_outcome = self._fire_hook(
+            "PreToolUse", tool=function_name, args=function_args,
+        )
+        if pre_outcome is not None and pre_outcome.blocked:
+            return json.dumps(
+                {"error": pre_outcome.block_reason or "blocked by PreToolUse hook"},
+                ensure_ascii=False,
+            )
+        if pre_outcome is not None and pre_outcome.transformed_args is not None:
+            function_args = pre_outcome.transformed_args
+        if pre_outcome is not None and pre_outcome.errors:
+            logger.warning("PreToolUse hook errors for %s: %s",
+                           function_name, "; ".join(pre_outcome.errors))
+
+        result = self._invoke_tool_dispatch(
+            function_name, function_args, effective_task_id,
+            tool_call_id=tool_call_id, messages=messages,
+            pre_tool_block_checked=pre_tool_block_checked,
+        )
+
+        # User-defined PostToolUse hook — fires after the tool produces
+        # its result.  Best-effort: errors are logged, the tool result
+        # passes through unchanged so the model's view is stable.
+        post_outcome = self._fire_hook(
+            "PostToolUse", tool=function_name, args=function_args, result=result,
+        )
+        if post_outcome is not None and post_outcome.errors:
+            logger.warning("PostToolUse hook errors for %s: %s",
+                           function_name, "; ".join(post_outcome.errors))
+
+        return result
+
+    def _invoke_tool_dispatch(self, function_name: str, function_args: dict, effective_task_id: str,
+                              tool_call_id: Optional[str] = None, messages: list = None,
+                              pre_tool_block_checked: bool = False) -> str:
+        """Pure dispatch for a single tool call. No hooks, no plan mode gate.
+
+        Handles both agent-level tools (todo, memory, etc.) and registry-dispatched
+        tools. Used by the concurrent execution path; the sequential path retains
+        its own inline invocation for backward-compatible display handling.
+        """
         # Check plugin hooks for a block directive before executing anything.
         block_message: Optional[str] = None
         if not pre_tool_block_checked:
@@ -11926,6 +11991,17 @@ class AIAgent:
             self.platform or "unknown", len(conversation_history or []),
             _msg_preview,
         )
+
+        # User-defined SessionStart hook — fires exactly once per agent
+        # instance, on the first run_conversation call.  Useful for
+        # injecting per-session telemetry, sourcing env files, or
+        # warming caches.  Best-effort: failures are logged.
+        if not getattr(self, "_session_start_fired", False):
+            self._session_start_fired = True
+            try:
+                self._fire_hook("SessionStart")
+            except Exception:
+                pass
 
         # Initialize conversation (copy to avoid mutating the caller's list)
         messages = list(conversation_history) if conversation_history else []
