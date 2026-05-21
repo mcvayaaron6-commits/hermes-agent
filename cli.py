@@ -4717,6 +4717,248 @@ class HermesCLI:
             # Treat as a git hash
             return ref
 
+    # ------------------------------------------------------------------
+    # Plan Mode / Hooks / Verification slash commands
+    # ------------------------------------------------------------------
+
+    def _handle_plan_command(self, command: str) -> None:
+        """Enter Plan Mode and prime the agent to investigate-and-plan.
+
+        Syntax:
+            /plan <task description>
+
+        Turns on the agent's PlanModeState, computes a per-cwd plan
+        artifact path (.hermes/plans/<slug>-<ts>.md), and queues a
+        synthetic user message that tells the model it's in plan mode
+        and what the task is.  The tool dispatcher will refuse any
+        mutating tool until /exit-plan releases the gate.
+        """
+        if not hasattr(self, "agent") or not self.agent:
+            print("  No active agent session.")
+            return
+        plan_mode = getattr(self.agent, "_plan_mode", None)
+        if plan_mode is None:
+            print("  Plan Mode is unavailable in this build.")
+            return
+        parts = command.split(None, 1)
+        task = parts[1].strip() if len(parts) > 1 else ""
+        if not task:
+            print("  Usage: /plan <task description>")
+            return
+        if plan_mode.enabled:
+            print(f"  Already in Plan Mode (task: {plan_mode.task!r}). "
+                  f"Use /exit-plan to leave or /plan-show to view.")
+            return
+        from pathlib import Path as _P
+        from agent.plan_mode import default_plan_path, PLAN_MODE_SYSTEM_PROMPT
+        cwd = _P(os.getenv("TERMINAL_CWD", os.getcwd()))
+        plans_dir = cwd / ".hermes" / "plans"
+        plan_path = default_plan_path(plans_dir, task)
+        plan_mode.enter(task=task, plan_path=plan_path)
+        print(f"  📋 Plan Mode active — read-only tools only.")
+        print(f"     Task: {task}")
+        print(f"     Plan will be saved to: {plan_path}")
+        print(f"     Investigate using read_file, search_files, web_search, ...")
+        print(f"     Use /exit-plan when ready to execute, /cancel-plan to abort.")
+        # Queue a synthetic user message that primes the model.
+        try:
+            self._pending_input.put(
+                f"{PLAN_MODE_SYSTEM_PROMPT}\n\n## Your task\n\n{task}"
+            )
+        except Exception as exc:
+            print(f"  (could not queue plan-mode prompt: {exc})")
+
+    def _handle_exit_plan_command(self) -> None:
+        """Leave Plan Mode, persist the latest assistant message as the
+        plan artifact, seed the todo list, and prime the agent for Act
+        Mode.
+        """
+        if not hasattr(self, "agent") or not self.agent:
+            print("  No active agent session.")
+            return
+        plan_mode = getattr(self.agent, "_plan_mode", None)
+        if plan_mode is None or not plan_mode.enabled:
+            print("  Not currently in Plan Mode.")
+            return
+        plan_path = plan_mode.plan_path
+        # Find the most recent assistant message — that's the plan.
+        latest_plan_text = ""
+        try:
+            for msg in reversed(self.conversation_history or []):
+                if msg.get("role") == "assistant":
+                    latest_plan_text = (msg.get("content") or "").strip()
+                    if latest_plan_text:
+                        break
+        except Exception:
+            pass
+        if not latest_plan_text:
+            print("  No assistant response yet — investigate first, then /exit-plan.")
+            return
+        try:
+            from agent.plan_mode import (
+                PlanArtifact, parse_steps_from_markdown, write_plan_artifact,
+            )
+            artifact = PlanArtifact(task=plan_mode.task,
+                                    context=latest_plan_text)
+            artifact.steps = parse_steps_from_markdown(latest_plan_text)
+            if plan_path is not None:
+                plan_path.parent.mkdir(parents=True, exist_ok=True)
+                # Persist the raw markdown the model produced — preserves
+                # whatever structure the agent chose.  The artifact's
+                # render_markdown wraps it in our schema if needed.
+                plan_path.write_text(latest_plan_text, encoding="utf-8")
+            # Seed the agent's todo store from the parsed steps.
+            todos_seeded = 0
+            try:
+                if artifact.steps and hasattr(self.agent, "_todo_store"):
+                    from tools.todo_tool import todo_tool as _todo_tool
+                    seed = [
+                        {"id": i, "content": step.description,
+                         "status": "completed" if step.done else "pending"}
+                        for i, step in enumerate(artifact.steps, 1)
+                    ]
+                    _todo_tool(todos=seed, store=self.agent._todo_store)
+                    todos_seeded = len(seed)
+            except Exception as exc:
+                logger.debug("could not seed todos from plan: %s", exc)
+        finally:
+            plan_mode.exit()
+        if plan_path is not None:
+            print(f"  ✅ Plan saved: {plan_path}")
+        print(f"  ▶ Act Mode active — full toolset restored.")
+        if todos_seeded:
+            print(f"  📌 Seeded {todos_seeded} todo step(s) from the plan.")
+        # Prime the agent to start executing.
+        try:
+            self._pending_input.put(
+                "Plan Mode complete and approved. Execute the plan you just "
+                "wrote — tick off each step in the todo list as you go, and "
+                "run the Verification commands when done."
+            )
+        except Exception:
+            pass
+
+    def _handle_plan_show_command(self) -> None:
+        """Display the current Plan Mode plan artifact (or last one)."""
+        if not hasattr(self, "agent") or not self.agent:
+            print("  No active agent session.")
+            return
+        plan_mode = getattr(self.agent, "_plan_mode", None)
+        if plan_mode is None or plan_mode.plan_path is None:
+            print("  No plan artifact for this session. Use /plan <task> to create one.")
+            return
+        path = plan_mode.plan_path
+        if not path.exists():
+            print(f"  Plan path is set but file does not exist yet: {path}")
+            return
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            print(f"  Could not read plan: {exc}")
+            return
+        print(f"  📋 {path}")
+        print()
+        print(text)
+
+    def _handle_hooks_command(self, command: str) -> None:
+        """List, reload, or trust user-defined lifecycle hooks.
+
+        Syntax:
+            /hooks            — list active hooks for this session
+            /hooks reload     — force-reload the registry from disk
+            /hooks trust      — trust the project's .hermes/hooks.json
+        """
+        if not hasattr(self, "agent") or not self.agent:
+            print("  No active agent session.")
+            return
+        parts = command.split(None, 1)
+        sub = (parts[1].strip().lower() if len(parts) > 1 else "")
+
+        if sub == "reload":
+            try:
+                self.agent._hook_registry = None
+                self.agent._hook_registry_loaded = False
+                registry = self.agent._get_hook_registry()
+                print(f"  ↻ Reloaded — {len(registry) if registry else 0} hook(s) active.")
+            except Exception as exc:
+                print(f"  Reload failed: {exc}")
+            return
+
+        if sub == "trust":
+            try:
+                from agent.hooks import _find_project_hooks_file, trust_path
+                from pathlib import Path as _P
+                hooks_file = _find_project_hooks_file(_P(os.getcwd()))
+                if hooks_file is None:
+                    print("  No project hooks file (.hermes/hooks.json) found from cwd.")
+                    return
+                trust_path(hooks_file)
+                print(f"  ✅ Trusted: {hooks_file}")
+                print("  Run /hooks reload to apply.")
+            except Exception as exc:
+                print(f"  Trust failed: {exc}")
+            return
+
+        # Default: list.
+        try:
+            registry = self.agent._get_hook_registry()
+        except Exception as exc:
+            print(f"  Could not load hook registry: {exc}")
+            return
+        if registry is None or len(registry) == 0:
+            print("  No user-defined hooks loaded.")
+            print("  Drop ~/.hermes/hooks.json or .hermes/hooks.json in your repo.")
+            return
+        report = getattr(self.agent, "_hook_load_report", None)
+        if report is not None:
+            for warn in report.warnings():
+                print(f"  ⚠ {warn}")
+        print(f"  {len(registry)} hook(s) loaded:")
+        for entry in registry.describe():
+            print(f"    {entry['event']:<18} matcher={entry['matcher']:<15} "
+                  f"timeout={entry['timeout']:>3}s  source={entry['source']:<7} "
+                  f"cmd={entry['command']}")
+
+    def _handle_verify_command(self) -> None:
+        """Manually trigger a verification pass on the most recent assistant
+        response.  Useful when verification is disabled in config but you
+        want a one-off sanity check.
+        """
+        if not hasattr(self, "agent") or not self.agent:
+            print("  No active agent session.")
+            return
+        latest_response = ""
+        try:
+            for msg in reversed(self.conversation_history or []):
+                if msg.get("role") == "assistant":
+                    latest_response = (msg.get("content") or "").strip()
+                    if latest_response:
+                        break
+        except Exception:
+            pass
+        if not latest_response:
+            print("  No assistant response yet to verify.")
+            return
+        try:
+            from agent.verification import render_summary_for_user
+            report = self.agent._run_verifier(final_response=latest_response)
+            if report is None:
+                # _run_verifier returns None when disabled and no plan
+                # artifact — for /verify we force it on by temporarily
+                # injecting a config-style flag.
+                print("  Verification is not configured and no plan exists. "
+                      "Set verification.enabled: true in config.yaml or "
+                      "run /plan first.")
+                return
+            print(f"  {render_summary_for_user(report)}")
+            if report.issues:
+                from agent.verification import render_rework_message
+                print()
+                print(render_rework_message(report,
+                                            getattr(self.agent._plan_mode, "plan_path", None)))
+        except Exception as exc:
+            print(f"  Verification failed: {exc}")
+
     def _handle_snapshot_command(self, command: str):
         """Handle /snapshot — lightweight state snapshots for Hermes config/state.
 
@@ -7555,6 +7797,16 @@ class HermesCLI:
                 print(f"Plugin system error: {e}")
         elif canonical == "rollback":
             self._handle_rollback_command(cmd_original)
+        elif canonical == "plan":
+            self._handle_plan_command(cmd_original)
+        elif canonical == "exit-plan":
+            self._handle_exit_plan_command()
+        elif canonical == "plan-show":
+            self._handle_plan_show_command()
+        elif canonical == "hooks":
+            self._handle_hooks_command(cmd_original)
+        elif canonical == "verify":
+            self._handle_verify_command()
         elif canonical == "snapshot":
             self._handle_snapshot_command(cmd_original)
         elif canonical == "stop":
