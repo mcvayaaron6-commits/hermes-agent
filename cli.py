@@ -11262,6 +11262,16 @@ class HermesCLI:
             return _state_fragment("class:prompt-working", "⚕")
         if self._voice_mode:
             return _state_fragment("class:voice-prompt", "🎤")
+
+        # Plan Mode indicator — visible at the resting prompt so users
+        # never forget they're in read-only mode.  Transient state
+        # symbols above (voice, sudo, approval, clarify, agent-running)
+        # take precedence to avoid prompt clutter.
+        plan_mode = getattr(getattr(self, "agent", None), "_plan_mode", None)
+        if plan_mode is not None and plan_mode.enabled:
+            return [("class:prompt-working", "📋 "),
+                    ("class:prompt", symbol)]
+
         return [("class:prompt", symbol)]
 
     def _get_tui_prompt_text(self) -> str:
