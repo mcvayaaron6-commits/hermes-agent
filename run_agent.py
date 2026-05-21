@@ -5785,6 +5785,128 @@ class AIAgent:
         except Exception:
             pass
 
+    def _verification_config(self) -> dict:
+        """Read the verification.* config block with sane defaults.
+
+        Defaults: disabled unless the user opts in.  When a Plan Mode
+        artifact exists for this session and ``verification.auto_when_plan``
+        is true (the default), verification runs even if the global
+        ``verification.enabled`` is false — the operator already opted
+        in by typing /plan, no need to flip a second switch.
+        """
+        try:
+            from hermes_cli.config import load_config
+            cfg = (load_config().get("verification") or {})
+        except Exception:
+            cfg = {}
+        return {
+            "enabled": bool(cfg.get("enabled", False)),
+            "auto_when_plan": bool(cfg.get("auto_when_plan", True)),
+            "max_attempts": max(1, int(cfg.get("max_attempts", 2))),
+            "model": cfg.get("model"),
+            "provider": cfg.get("provider"),
+            "max_tokens": int(cfg.get("max_tokens", 2000)),
+        }
+
+    def _capture_git_diff(self) -> Optional[str]:
+        """Best-effort: git diff between origin/HEAD (or HEAD~ for solo dev)
+        and the current working tree, for the verifier to inspect.
+
+        Returns None when not in a git repo or git fails.  Never raises —
+        verification must work in non-git contexts (the verifier still has
+        the plan + final response to judge on).
+        """
+        import subprocess as _subproc
+        for ref in ("HEAD", "HEAD~1"):
+            try:
+                result = _subproc.run(
+                    ["git", "diff", "--no-color", ref],
+                    capture_output=True, text=True, timeout=10,
+                    cwd=os.getcwd(),
+                )
+                if result.returncode == 0:
+                    out = (result.stdout or "").strip()
+                    if out:
+                        return out[:64 * 1024]
+                    return ""
+            except (_subproc.TimeoutExpired, FileNotFoundError, OSError):
+                continue
+        return None
+
+    def _call_verifier_llm(self, messages: list, *, model: Optional[str],
+                           provider: Optional[str], max_tokens: int) -> str:
+        """Mockable seam for the verifier model call.  Returns raw text."""
+        from agent.auxiliary_client import call_llm
+        response = call_llm(
+            provider=provider,
+            model=model or self.model,
+            messages=messages,
+            temperature=0.0,
+            max_tokens=max_tokens,
+        )
+        try:
+            return (response.choices[0].message.content or "").strip()
+        except (AttributeError, IndexError, KeyError):
+            return ""
+
+    def _run_verifier(self, *, final_response: str,
+                      plan_path: Optional[str] = None,
+                      test_output: Optional[str] = None) -> Optional[Any]:
+        """Spawn the verifier and return a VerificationReport, or None when
+        verification is disabled for this run.
+
+        Never raises — a failed verifier produces a STATUS_ERROR report
+        the caller can surface or ignore.
+        """
+        cfg = self._verification_config()
+        plan_mode = getattr(self, "_plan_mode", None)
+        plan_path_obj = None
+        if plan_mode is not None and plan_mode.plan_path is not None:
+            plan_path_obj = plan_mode.plan_path
+        elif plan_path:
+            from pathlib import Path as _P
+            plan_path_obj = _P(plan_path)
+
+        if not cfg["enabled"] and not (cfg["auto_when_plan"] and plan_path_obj is not None):
+            return None
+
+        from agent.verification import (
+            VERIFIER_SYSTEM_PROMPT, build_verifier_user_prompt,
+            parse_verification_response, VerificationReport, STATUS_ERROR,
+        )
+
+        plan_text: Optional[str] = None
+        if plan_path_obj is not None:
+            try:
+                plan_text = plan_path_obj.read_text(encoding="utf-8")
+            except OSError:
+                plan_text = None
+
+        user_prompt = build_verifier_user_prompt(
+            plan_text=plan_text,
+            final_response=final_response,
+            git_diff=self._capture_git_diff(),
+            test_output=test_output,
+        )
+        messages = [
+            {"role": "system", "content": VERIFIER_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ]
+        try:
+            response_text = self._call_verifier_llm(
+                messages,
+                model=cfg["model"],
+                provider=cfg["provider"],
+                max_tokens=cfg["max_tokens"],
+            )
+        except Exception as exc:
+            logger.warning("verifier dispatch failed: %s", exc)
+            return VerificationReport(
+                status=STATUS_ERROR,
+                summary=f"verifier dispatch failed: {exc}",
+            )
+        return parse_verification_response(response_text)
+
     def _get_hook_registry(self):
         """Lazy-load the user-defined hook registry on first use.
 
@@ -15766,6 +15888,7 @@ class AIAgent:
         # test run before the agent declares "done").  Exit 2 surfaces the
         # block reason into result["stop_hook_block"] so callers can decide
         # whether to re-enter the loop with the reason as a follow-up turn.
+        stop_hook_context_lines: list[str] = []
         if final_response and not interrupted:
             stop_outcome = self._fire_hook("Stop", final_response=final_response)
             if stop_outcome is not None:
@@ -15774,10 +15897,33 @@ class AIAgent:
                         "reason": stop_outcome.block_reason or "blocked by Stop hook",
                     }
                 if stop_outcome.additional_context:
-                    result["stop_hook_context"] = list(stop_outcome.additional_context)
+                    stop_hook_context_lines = list(stop_outcome.additional_context)
+                    result["stop_hook_context"] = stop_hook_context_lines
                 if stop_outcome.errors:
                     logger.warning("Stop hook errors: %s",
                                    "; ".join(stop_outcome.errors))
+
+        # Autonomous self-verification — only runs when verification is
+        # enabled in config OR a Plan Mode artifact exists for this
+        # session (verification.auto_when_plan).  Skipped when the Stop
+        # hook already blocked: the operator's hook is the authority.
+        if (final_response and not interrupted
+                and not result.get("stop_hook_block")):
+            try:
+                _test_output = "\n\n".join(stop_hook_context_lines) if stop_hook_context_lines else None
+                _report = self._run_verifier(
+                    final_response=final_response,
+                    test_output=_test_output,
+                )
+                if _report is not None:
+                    result["verification"] = _report.to_dict()
+                    if _report.needs_rework:
+                        from agent.verification import render_rework_message
+                        plan_mode = getattr(self, "_plan_mode", None)
+                        plan_path = plan_mode.plan_path if plan_mode is not None else None
+                        result["rework_message"] = render_rework_message(_report, plan_path)
+            except Exception as exc:
+                logger.warning("verification pass failed: %s", exc)
 
         return result
 
