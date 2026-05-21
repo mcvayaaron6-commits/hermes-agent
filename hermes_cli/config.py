@@ -682,6 +682,53 @@ DEFAULT_CONFIG = {
         "min_interval_hours": 24,
     },
 
+    # Plan Mode — first-class "investigate before mutating" toggle.  When
+    # on (via the `/plan <task>` slash command), the tool dispatcher
+    # refuses any tool not on the read-only allowlist until /exit-plan
+    # releases the gate.  Operators can widen or tighten the allowlist
+    # below.  See website/docs/user-guide/features/plan-mode.md.
+    "plan_mode": {
+        # Extra tools that should be allowed while in Plan Mode in
+        # addition to the built-in read-only allowlist.  Useful for
+        # team-specific static-analysis tools that are technically
+        # read-only but ship in your own plugins.
+        "allow_tools": [],
+        # Tools that should be blocked even though they're on the
+        # default allowlist.  Useful when, e.g., you don't want the
+        # agent fetching arbitrary URLs during planning.
+        "deny_tools": [],
+    },
+
+    # Self-verification — when the model emits a final non-tool
+    # response, an LLM verifier (using the same provider as the main
+    # agent unless overridden below) re-reads the plan + diff + any
+    # Stop-hook output and emits a strict JSON VERIFIED / NEEDS_REWORK
+    # verdict.  NEEDS_REWORK surfaces a rework message the caller can
+    # re-inject as the next user turn so the agent fixes the gaps
+    # before the answer reaches the user.  See
+    # website/docs/user-guide/features/verification.md.
+    "verification": {
+        # Master switch.  Default off; opt in here or via /verify.
+        "enabled": False,
+        # When True (default), verification runs automatically whenever
+        # a Plan Mode artifact exists for the session — typing /plan
+        # already opts you into careful-mode, no need to flip this
+        # switch separately.
+        "auto_when_plan": True,
+        # Number of NEEDS_REWORK cycles to attempt before giving up
+        # and surfacing the verifier report alongside the original
+        # answer.
+        "max_attempts": 2,
+        # Provider/model overrides for the verifier subagent.  null
+        # means "use the agent's main provider/model."  Routing
+        # verification to a cheaper model (e.g. Haiku when running
+        # on Opus) is usually a cost win without losing rigor —
+        # the verifier grades concrete evidence, not generates it.
+        "provider": None,
+        "model": None,
+        "max_tokens": 2000,
+    },
+
     # Maximum characters returned by a single read_file call.  Reads that
     # exceed this are rejected with guidance to use offset+limit.
     # 100K chars ≈ 25–35K tokens across typical tokenisers.
