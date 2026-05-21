@@ -143,6 +143,22 @@ VALID_HOOKS: Set[str] = {
     "on_session_finalize",
     "on_session_reset",
     "subagent_stop",
+    # User prompt lifecycle — fires once per user turn BEFORE the
+    # message hits the transcript or the model.  Plugins / shell hooks
+    # can return {"action": "block", "message": "..."} to refuse the
+    # message (the agent returns a synthetic [Blocked by hook] response)
+    # or contribute additional_context that gets prepended inside a
+    # <hook-context> envelope.  Bridged from the user-defined-hooks
+    # ``UserPromptSubmit`` event (agent/hooks.py).
+    # Kwargs: user_message: str, session_id: str
+    "user_prompt_submit",
+    # Final-response gate — fires when the agent emits a non-tool final
+    # response, BEFORE it reaches the user.  Plugins / shell hooks can
+    # surface test/lint output via additional_context, which the
+    # self-verification subagent uses as evidence.  Bridged from the
+    # user-defined-hooks ``Stop`` event (agent/hooks.py).
+    # Kwargs: final_response: str, session_id: str
+    "stop",
     # Gateway pre-dispatch hook. Fired once per incoming MessageEvent
     # after the internal-event guard but BEFORE auth/pairing and agent
     # dispatch. Plugins may return a dict to influence flow:

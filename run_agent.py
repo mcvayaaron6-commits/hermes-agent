@@ -5939,11 +5939,15 @@ class AIAgent:
     #: canonical Hermes invoke_hook() names that shell_hooks /
     #: Python-plugin authors listen for.  Only events whose canonical
     #: counterpart is otherwise un-fired in production are bridged here;
-    #: PreToolUse/SessionEnd skip the bridge to avoid double-firing.
+    #: PreToolUse/SessionEnd skip the bridge to avoid double-firing
+    #: with the existing production sites that already fire
+    #: pre_tool_call / on_session_end.
     _HOOK_BRIDGE: dict[str, str] = {
         "PostToolUse": "post_tool_call",
         "SessionStart": "on_session_start",
         "SubagentStop": "subagent_stop",
+        "UserPromptSubmit": "user_prompt_submit",
+        "Stop": "stop",
     }
 
     def _fire_hook(self, event: str, **payload):
