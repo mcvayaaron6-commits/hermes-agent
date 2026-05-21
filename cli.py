@@ -10881,6 +10881,36 @@ class HermesCLI:
             # Get the final response
             response = result.get("final_response", "") if result else ""
 
+            # Auto-rework: when the verifier surfaced a NEEDS_REWORK
+            # report, queue the rework message so the next turn picks it
+            # up automatically.  Capped per user-initiated task so a
+            # stuck verifier can't loop forever — the user can always
+            # /stop or ctrl+C, and the next genuine user message will
+            # arrive ahead of any further auto-queued rework.
+            if isinstance(result, dict) and result.get("rework_message"):
+                try:
+                    cfg = self.agent._verification_config()
+                    max_attempts = int(cfg.get("max_attempts", 2))
+                except Exception:
+                    max_attempts = 2
+                _rework_count = getattr(self, "_verification_rework_count", 0)
+                if _rework_count < max_attempts:
+                    self._verification_rework_count = _rework_count + 1
+                    print(f"  🔁 Verifier requested rework "
+                          f"(attempt {self._verification_rework_count}/{max_attempts})")
+                    try:
+                        self._pending_input.put(result["rework_message"])
+                    except Exception as exc:
+                        logger.debug("could not queue rework message: %s", exc)
+                else:
+                    print(f"  ⚠ Verifier still unsatisfied after "
+                          f"{max_attempts} rework attempt(s) — surfacing the "
+                          f"original response.")
+                    self._verification_rework_count = 0
+            elif isinstance(result, dict) and result.get("verification"):
+                # VERIFIED — reset the counter for the next task.
+                self._verification_rework_count = 0
+
             # Auto-generate session title after first exchange (non-blocking)
             if response and result and not result.get("failed") and not result.get("partial"):
                 try:
