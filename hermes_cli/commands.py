@@ -91,6 +91,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                "Session", args_hint="<task description>", cli_only=True),
     CommandDef("exit-plan", "Leave Plan Mode and execute the plan (Act Mode)",
                "Session", cli_only=True),
+    CommandDef("cancel-plan", "Abort Plan Mode without saving the artifact",
+               "Session", cli_only=True),
     CommandDef("plan-show", "Display the current session's plan artifact",
                "Session", cli_only=True),
     CommandDef("hooks", "List user-defined lifecycle hooks loaded for this session",

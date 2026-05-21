@@ -4838,6 +4838,34 @@ class HermesCLI:
         except Exception:
             pass
 
+    def _handle_cancel_plan_command(self) -> None:
+        """Abort Plan Mode without persisting the artifact.
+
+        Useful when the agent went down the wrong investigative path
+        and you want to start fresh with a different /plan.  The
+        partial artifact file (if any) is deleted; the in-memory
+        PlanModeState is reset.
+        """
+        if not hasattr(self, "agent") or not self.agent:
+            print("  No active agent session.")
+            return
+        plan_mode = getattr(self.agent, "_plan_mode", None)
+        if plan_mode is None or not plan_mode.enabled:
+            print("  Not currently in Plan Mode.")
+            return
+        path = plan_mode.plan_path
+        plan_mode.reset()
+        # Best-effort: remove a stale partial file if it exists.
+        if path is not None and path.exists():
+            try:
+                path.unlink()
+                print(f"  ✗ Plan Mode cancelled — removed partial artifact at {path}")
+            except OSError as exc:
+                print(f"  ✗ Plan Mode cancelled — could not remove {path}: {exc}")
+        else:
+            print("  ✗ Plan Mode cancelled.")
+        print("  ▶ Full toolset restored.")
+
     def _handle_plan_show_command(self) -> None:
         """Display the current Plan Mode plan artifact (or last one)."""
         if not hasattr(self, "agent") or not self.agent:
@@ -7801,6 +7829,8 @@ class HermesCLI:
             self._handle_plan_command(cmd_original)
         elif canonical == "exit-plan":
             self._handle_exit_plan_command()
+        elif canonical == "cancel-plan":
+            self._handle_cancel_plan_command()
         elif canonical == "plan-show":
             self._handle_plan_show_command()
         elif canonical == "hooks":
