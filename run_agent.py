@@ -5935,18 +5935,62 @@ class AIAgent:
                 self._hook_registry = None
         return self._hook_registry
 
+    #: Bridge map from new Claude-Code-style event names to the
+    #: canonical Hermes invoke_hook() names that shell_hooks /
+    #: Python-plugin authors listen for.  Only events whose canonical
+    #: counterpart is otherwise un-fired in production are bridged here;
+    #: PreToolUse/SessionEnd skip the bridge to avoid double-firing.
+    _HOOK_BRIDGE: dict[str, str] = {
+        "PostToolUse": "post_tool_call",
+        "SessionStart": "on_session_start",
+        "SubagentStop": "subagent_stop",
+    }
+
     def _fire_hook(self, event: str, **payload):
         """Fire a hook event.  Returns a HookOutcome; never raises.
 
         Designed for fire-and-forget call sites — the caller can inspect
         the returned outcome for ``blocked``, ``transformed_args``, or
         ``additional_context`` but is not required to.
+
+        Bridge: for events that have a canonical Hermes counterpart
+        that's defined in VALID_HOOKS but not actually fired anywhere
+        else in production, this method also dispatches via the plugin
+        manager's ``invoke_hook`` so shell_hooks and Python plugins see
+        them too.  See ``_HOOK_BRIDGE`` for the mapping rationale.
         """
         try:
             from agent.hooks import HookOutcome, run_hooks
         except Exception as exc:
             logger.debug("hooks module unavailable for %s: %s", event, exc)
             return None
+
+        # Bridge: route to invoke_hook for events whose Hermes-canonical
+        # counterpart is otherwise dormant in production.
+        canonical = self._HOOK_BRIDGE.get(event)
+        if canonical is not None:
+            try:
+                from hermes_cli.plugins import invoke_hook as _invoke_hook
+                # Map our payload keys to the Hermes-canonical names so
+                # existing shell_hooks / plugin authors don't need to
+                # learn our schema.
+                bridge_kwargs: dict = {
+                    "session_id": str(getattr(self, "session_id", "") or ""),
+                }
+                if "tool" in payload:
+                    bridge_kwargs["tool_name"] = payload["tool"]
+                if "args" in payload:
+                    bridge_kwargs["args"] = payload["args"] or {}
+                if "result" in payload:
+                    bridge_kwargs["result"] = payload["result"]
+                if "agent_name" in payload:
+                    bridge_kwargs["agent_name"] = payload["agent_name"]
+                if "final_response" in payload:
+                    bridge_kwargs["final_response"] = payload["final_response"]
+                _invoke_hook(canonical, **bridge_kwargs)
+            except Exception as exc:
+                logger.debug("hook bridge to %s failed: %s", canonical, exc)
+
         try:
             registry = self._get_hook_registry()
             if registry is None or not registry.has_any(event):
