@@ -189,6 +189,25 @@ individual profiles. Future work: thread `model` / `max_iterations` /
 `max_tokens` / `permission_mode` overrides from the frontmatter
 through `_build_child_agent`'s credential-resolution path.
 
+### Lessons Learned (`agent/lessons.py`)
+
+The compounding-intelligence layer.  When the CLI's auto-rework loop
+(`cli.py:_handle_response`) converges on `VERIFIED` after at least one
+`NEEDS_REWORK` cycle, `capture_from_rework()` writes a markdown
+lesson to `~/.hermes/lessons/<slug>-<ts>.md` containing task,
+initial approach, what went wrong, and what worked.
+
+At the start of every subsequent session, `AIAgent.run_conversation()`
+gates on `self._lessons_preamble_injected` (one-shot per agent):
+`relevant_lessons(user_message)` scores all lessons by fuzzy tag +
+text overlap (no embeddings), and the top 3 are prepended as a
+`<lessons-learned>` preamble inside the user message.
+
+The scoring filters zero-overlap matches entirely — recency boost
+only applies when there's other signal, so a fresh unrelated lesson
+doesn't displace real context.  `/lessons` slash command for
+browsing.
+
 ### Self-Verification (`agent/verification.py`)
 
 `AIAgent._run_verifier()` spawns a verifier model call (through the
