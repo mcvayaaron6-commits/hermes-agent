@@ -170,6 +170,25 @@ on the read-only allowlist via `plan_mode.is_tool_allowed(name, args)`.
 artifact persists at `.hermes/plans/<slug>-<ts>.md` and seeds the
 in-memory todo store on `/exit-plan` so progress is visible.
 
+### Named Subagent Profiles (`agent/subagent_profiles.py`)
+
+Profiles live as markdown-with-YAML-frontmatter files under
+`~/.hermes/agents/` (user) and `<cwd>/.hermes/agents/` (project; project
+beats user when names collide). `discover_profiles()` builds a
+`SubagentProfileRegistry` lazily on the parent agent the first time
+`delegate_task` runs in a session; subsequent calls hit the cache.
+
+`tools/delegate_tool.delegate_task` accepts a `subagent_type` parameter
+(top-level or per-task in batch mode). When set, the profile's body is
+prepended to the task's `context` (separated by `---`) and its
+`toolsets` whitelist is applied when the task hasn't set its own.
+Unknown profile names return a clear error listing the registry.
+
+`/subagents` and `/profiles` slash commands list, reload, or show
+individual profiles. Future work: thread `model` / `max_iterations` /
+`max_tokens` / `permission_mode` overrides from the frontmatter
+through `_build_child_agent`'s credential-resolution path.
+
 ### Self-Verification (`agent/verification.py`)
 
 `AIAgent._run_verifier()` spawns a verifier model call (through the
