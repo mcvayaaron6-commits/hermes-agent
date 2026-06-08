@@ -699,6 +699,22 @@ DEFAULT_CONFIG = {
         "deny_tools": [],
     },
 
+    # Named subagent profiles — operator-level controls.  See
+    # website/docs/user-guide/features/subagents.md.  Profiles live as
+    # markdown-with-frontmatter files under ~/.hermes/agents/ (user-
+    # global) and .hermes/agents/ (per-project).
+    "subagents": {
+        # When False, profiles loaded from a project-level
+        # .hermes/agents/ directory are ignored entirely.  Use this when
+        # you operate Hermes against untrusted repos and don't want
+        # repo-supplied prompts to influence delegated subagents
+        # (confused-deputy guard — profiles only inject system prompts,
+        # not arbitrary shell, but the prompt-injection blast radius
+        # is still real for agents that delegate on user input).
+        # User-global profiles in ~/.hermes/agents/ are always trusted.
+        "allow_project_profiles": True,
+    },
+
     # Self-verification — when the model emits a final non-tool
     # response, an LLM verifier (using the same provider as the main
     # agent unless overridden below) re-reads the plan + diff + any

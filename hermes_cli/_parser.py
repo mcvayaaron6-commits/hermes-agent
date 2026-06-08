@@ -122,6 +122,19 @@ def build_top_level_parser():
             "on verifier outcomes or read token budgets."
         ),
     )
+    parser.add_argument(
+        "--no-fail-on-rework",
+        dest="fail_on_rework",
+        action="store_false",
+        default=True,
+        help=(
+            "For -z --output-format json: do not exit non-zero when "
+            "verification.status == NEEDS_REWORK.  Default behaviour "
+            "gates CI on verification; use this flag when verification "
+            "is informational (e.g. you pipe the envelope into Slack "
+            "and don't want a build failure for every rework cycle)."
+        ),
+    )
     # --model / --provider are accepted at the top level so they can pair
     # with -z without needing the `chat` subcommand.  If neither -z nor a
     # subcommand consumes them, they fall through harmlessly as None.

@@ -127,6 +127,7 @@ def run_oneshot(
     provider: Optional[str] = None,
     toolsets: object = None,
     output_format: str = "text",
+    fail_on_rework: bool = True,
 ) -> int:
     """Execute a single prompt and print the final content block.
 
@@ -185,13 +186,12 @@ def run_oneshot(
     try:
         with redirect_stdout(devnull), redirect_stderr(devnull):
             if want_json:
-                response, result_dict = _run_agent(
+                response, result_dict = _run_agent_with_details(
                     prompt,
                     model=model,
                     provider=provider,
                     toolsets=explicit_toolsets,
                     use_config_toolsets=use_config_toolsets,
-                    return_dict=True,
                 )
             else:
                 response = _run_agent(
@@ -215,8 +215,9 @@ def run_oneshot(
         real_stdout.flush()
         # Exit non-zero when the verifier surfaced NEEDS_REWORK so CI
         # pipelines can gate on it.  Plain text mode doesn't have this
-        # because there's nowhere to put the signal.
-        if envelope.get("verification", {}).get("status") == "NEEDS_REWORK":
+        # because there's nowhere to put the signal.  Disable via
+        # --no-fail-on-rework when verification is informational.
+        if fail_on_rework and envelope.get("verification", {}).get("status") == "NEEDS_REWORK":
             return 1
         return 0
 
@@ -294,17 +295,15 @@ def _run_agent(
     provider: Optional[str] = None,
     toolsets: object = None,
     use_config_toolsets: bool = True,
-    return_dict: bool = False,
-) -> tuple:
+    return_dict: bool = False,  # back-compat shim — see _run_agent_with_details
+) -> object:
     """Build an AIAgent exactly like a normal CLI chat turn would, then
-    run a single conversation.
+    run a single conversation.  Returns the final response string.
 
-    When ``return_dict`` is False (default), returns ``(response_string, None)``
-    — keeps the existing text-mode path zero-overhead.
-
-    When True, calls ``run_conversation`` directly and returns
-    ``(response_string, full_result_dict)`` so JSON-format mode can
-    pull token counts, verification status, etc.
+    Back-compat: when ``return_dict=True`` (used internally by JSON
+    output mode), returns ``(response_string, result_dict)`` instead.
+    New callers should use ``_run_agent_with_details`` for the tuple
+    shape and leave this function as a plain ``-> str``.
     """
     # Imports are local so they don't run when hermes is invoked for
     # other commands (keeps top-level CLI startup cheap).
@@ -416,16 +415,33 @@ def _run_agent(
     agent.tool_gen_callback = None
 
     if return_dict:
-        # JSON-format path: use run_conversation directly to capture
-        # the full result envelope (tokens, verification, cost, etc.)
-        # instead of just the text response.
+        # Back-compat shim — new callers should use _run_agent_with_details.
         result = agent.run_conversation(prompt)
         response = (result.get("final_response") or "") if isinstance(result, dict) else ""
         return response, (result if isinstance(result, dict) else None)
-    # Backward-compatible default — returns a plain string so existing
-    # callers (and tests) that pre-date the JSON-format flag continue
-    # to work unchanged.
     return agent.chat(prompt) or ""
+
+
+def _run_agent_with_details(
+    prompt: str,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+    toolsets: object = None,
+    use_config_toolsets: bool = True,
+) -> tuple:
+    """Variant of ``_run_agent`` that returns ``(response, result_dict)``.
+
+    Used by the JSON-output path so it can pull telemetry,
+    verification status, rework_message, etc. from the
+    ``run_conversation`` result.  Always returns a 2-tuple — the dict
+    may be ``None`` if dispatch went sideways but the response came
+    back through ``agent.chat`` as a fallback.
+    """
+    response, result = _run_agent(
+        prompt, model=model, provider=provider, toolsets=toolsets,
+        use_config_toolsets=use_config_toolsets, return_dict=True,
+    )
+    return response, result
 
 
 def _oneshot_clarify_callback(question: str, choices=None) -> str:

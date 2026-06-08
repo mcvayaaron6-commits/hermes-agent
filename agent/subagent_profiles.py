@@ -285,6 +285,24 @@ def parse_profile(
         logger.debug("subagent profile %s has unknown frontmatter keys: %s",
                      name, ", ".join(sorted(unknown)))
 
+    # Honest warning: these fields are accepted by the parser but the
+    # wiring layer doesn't yet thread them into _build_child_agent's
+    # credential-resolution path.  Silent no-ops would surprise users
+    # who set e.g. ``model: openrouter/anthropic/claude-haiku-4-5`` to
+    # save cost and get the parent's model anyway.
+    for key in ("model", "provider", "max_iterations",
+                "max_tokens", "permission_mode"):
+        if front.get(key) is not None:
+            logger.info(
+                "subagent profile %s: '%s' is parsed but not yet applied "
+                "by delegate_task; the parent agent's value is used "
+                "instead.  Tracked as a follow-up — see "
+                "website/docs/user-guide/features/subagents.md "
+                "'Limitations (deliberate)'.",
+                name, key,
+            )
+            break  # one warning per profile is enough
+
     return SubagentProfile(
         name=str(name),
         system_prompt=body,
@@ -406,6 +424,7 @@ def discover_profiles(
     cwd: Optional[Path] = None,
     user_agents_dir: Optional[Path] = None,
     builtin_dirs: Sequence[Path] = (),
+    allow_project_profiles: bool = True,
 ) -> SubagentProfileRegistry:
     """Walk the standard locations and return a populated registry.
 
@@ -415,7 +434,13 @@ def discover_profiles(
     1. Built-in dirs (typically empty for now; reserved for bundled
        profiles like ``Explore`` or ``code-reviewer``)
     2. ``user_agents_dir`` (defaults to ``~/.hermes/agents``)
-    3. ``<cwd>/.hermes/agents`` if it exists
+    3. ``<cwd>/.hermes/agents`` if it exists AND ``allow_project_profiles``
+       is True.  Project profiles can be disabled via the
+       ``subagents.allow_project_profiles: false`` config key for
+       operators running against untrusted repos — profile bodies are
+       prompts, not arbitrary code, but a malicious project profile
+       could still inject "ignore safety rules" into delegated
+       subagents.
 
     The function never raises — discovery failures (bad file, bad
     frontmatter) log warnings and continue.  An empty registry is a
@@ -440,17 +465,18 @@ def discover_profiles(
             if profile is not None:
                 registry.register(profile)
 
-    if cwd is None:
-        try:
-            cwd = Path.cwd()
-        except (OSError, RuntimeError):
-            cwd = None
-    if cwd is not None:
-        project_dir = cwd / ".hermes" / "agents"
-        for child in _safe_iter_dir(project_dir):
-            profile = _load_profile_from_file(child, source="project")
-            if profile is not None:
-                registry.register(profile)
+    if allow_project_profiles:
+        if cwd is None:
+            try:
+                cwd = Path.cwd()
+            except (OSError, RuntimeError):
+                cwd = None
+        if cwd is not None:
+            project_dir = cwd / ".hermes" / "agents"
+            for child in _safe_iter_dir(project_dir):
+                profile = _load_profile_from_file(child, source="project")
+                if profile is not None:
+                    registry.register(profile)
 
     return registry
 

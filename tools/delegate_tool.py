@@ -1898,18 +1898,29 @@ def _recover_tasks_from_json_string(
 def _get_subagent_profile_registry(parent_agent):
     """Lazy-load and cache the subagent profile registry on the parent agent.
 
-    The registry is discovered on first use and cached as an attribute
-    on the agent so subsequent delegations in the same session don't
-    re-read the disk.  Use ``parent_agent._subagent_profile_registry =
-    None`` (or call ``/agents reload``) to force a refresh after
-    editing a profile file.
+    The registry is discovered on first use using the cwd at that moment
+    and cached as an attribute on the agent so subsequent delegations
+    in the same session don't re-read the disk.  If the process changes
+    its cwd mid-session, the cache will not pick up profiles from the
+    new cwd until you call ``/subagents reload`` (or set
+    ``parent_agent._subagent_profile_registry = None``).
+
+    Reads ``subagents.allow_project_profiles`` from config.yaml.  When
+    False, project-level profiles from ``.hermes/agents/`` are skipped
+    entirely — useful when operating against untrusted repos.
     """
     cached = getattr(parent_agent, "_subagent_profile_registry", None)
     if cached is not None:
         return cached
     try:
+        from hermes_cli.config import load_config
+        cfg = (load_config().get("subagents") or {})
+        allow_project = bool(cfg.get("allow_project_profiles", True))
+    except Exception:
+        allow_project = True
+    try:
         from agent.subagent_profiles import discover_profiles
-        registry = discover_profiles()
+        registry = discover_profiles(allow_project_profiles=allow_project)
     except Exception as exc:
         logger.debug("subagent profile discovery failed: %s", exc)
         from agent.subagent_profiles import SubagentProfileRegistry
@@ -2055,26 +2066,38 @@ def delegate_task(
             continue
         profile = _profile_registry.get(st)
         if profile is None:
-            available = ", ".join(_profile_registry.names()) or "(none)"
+            # Truncate the available-profiles list so a typo against a
+            # large registry doesn't waste the model's tool-output
+            # budget on a wall of names.
+            all_names = _profile_registry.names()
+            preview = all_names[:10]
+            shown = ", ".join(preview) or "(none)"
+            if len(all_names) > len(preview):
+                shown += f", and {len(all_names) - len(preview)} more"
+                shown += " — run /subagents to list all"
             return tool_error(
                 f"Unknown subagent_type {st!r}. "
-                f"Available profiles: {available}. "
+                f"Available profiles: {shown}. "
                 f"Add one as ~/.hermes/agents/<name>.md."
             )
         # Prepend the profile's system prompt to the task's context.
         # The profile body acts as persistent identity for this turn;
-        # the task's own context remains the per-call framing.
+        # the task's own context remains the per-call framing.  Use a
+        # collision-resistant boundary (a fenced section header) rather
+        # than bare --- so an existing context containing markdown
+        # horizontal rules doesn't blur the boundary.
         existing_ctx = task.get("context") or ""
         merged_ctx = profile.system_prompt.strip()
         if existing_ctx.strip():
-            merged_ctx = f"{merged_ctx}\n\n---\n\n{existing_ctx}"
+            merged_ctx = (
+                f"{merged_ctx}\n\n"
+                f"=== TASK CONTEXT BELOW ===\n\n"
+                f"{existing_ctx}"
+            )
         task["context"] = merged_ctx
         # Apply toolset whitelist only when the task hasn't set one.
         if not task.get("toolsets") and profile.toolsets:
             task["toolsets"] = list(profile.toolsets)
-        # Stash the profile on the task so downstream code (logs,
-        # progress events) can surface which profile is running.
-        task["_resolved_profile_name"] = profile.name
 
     overall_start = time.monotonic()
     results = []
