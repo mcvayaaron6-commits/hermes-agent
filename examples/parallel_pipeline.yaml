@@ -1,0 +1,67 @@
+# Example: parallel feature-ship pipeline.
+#
+# Run with:
+#
+#     hermes orchestrate examples/parallel_pipeline.yaml
+#     hermes orchestrate examples/parallel_pipeline.yaml --dry-run
+#     hermes orchestrate examples/parallel_pipeline.yaml --output-format json
+#
+# The pipeline below ships a new /v2/users endpoint by parallelising the
+# work across four subagents:
+#
+#                  ┌─ schema ─┐
+#       ┌─ server ─┤          ├─ tests ─┐
+#       │          └──────────┘         │
+#                                       ├─ docs
+#                                       │
+#                                       └─ (ready for review)
+#
+# `server` and `schema` are independent — they run in parallel.
+# `tests` waits for both to finish before starting.
+# `docs` only needs `server` to be done.
+# Write_paths arbitration prevents any two tasks from clobbering each
+# other on shared files even if their goals overlap.
+
+fanout: 4
+
+tasks:
+  - id: server
+    goal: |
+      Add a GET /v2/users endpoint to api/server.py.  The endpoint
+      should return a paginated list of users matching the existing
+      v1 contract but using the new User v2 schema.  Use the existing
+      router patterns; don't introduce a new framework.
+    subagent_type: code-reviewer
+    write_paths:
+      - api/server.py
+
+  - id: schema
+    goal: |
+      Add a User v2 Pydantic schema to api/schemas/user.py.  Include
+      created_at and updated_at as ISO-8601 strings; deprecate the
+      v1 'avatar' field in favour of 'avatar_url'.  Mirror the
+      conventions in api/schemas/post.py.
+    write_paths:
+      - api/schemas/user.py
+
+  - id: tests
+    goal: |
+      Write pytest tests for the new /v2/users endpoint at
+      tests/api/test_users_v2.py.  Cover the happy path plus four
+      edge cases: empty result, pagination, schema validation error,
+      and authentication required.  Run pytest before reporting
+      done.
+    subagent_type: test-writer
+    depends_on: [server, schema]
+    write_paths:
+      - tests/api/test_users_v2.py
+
+  - id: docs
+    goal: |
+      Update docs/api/users.md to document the new /v2/users
+      endpoint.  Match the formatting of the existing /v1/users
+      section; add a 'Migration from v1' subsection that calls out
+      the avatar -> avatar_url rename.
+    depends_on: [server]
+    write_paths:
+      - docs/api/users.md

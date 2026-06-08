@@ -5064,7 +5064,24 @@ class HermesCLI:
         parts = command.split(None, 2)
         sub = (parts[1].strip().lower() if len(parts) > 1 else "list")
 
+        # Skill candidates from clustered lessons.
         candidates = _sp.find_skill_candidates()
+        # Profile candidates from heavy skill usage.  Read the existing
+        # skill_usage tracker that's already in production — every skill
+        # invocation increments use_count there.
+        try:
+            from tools.skill_usage import load_usage as _load_usage
+            usage_data = _load_usage() or {}
+            usage_counts = {
+                name: int(rec.get("use_count") or 0)
+                for name, rec in usage_data.items()
+            }
+            profile_candidates = _sp.find_profile_candidates_from_usage(
+                usage_counts,
+            )
+            candidates.extend(profile_candidates)
+        except Exception as exc:
+            logger.debug("profile-candidate lookup failed: %s", exc)
         candidates = _sp.filter_already_installed(candidates)
 
         if not candidates:

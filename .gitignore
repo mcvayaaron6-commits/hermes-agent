@@ -21,7 +21,11 @@ data/
 tmp/
 temp_vision_images/
 hermes-*/*
-examples/
+# examples/ used to be ignored when it held one-off scratch — the
+# directory now contains canonical runnable demos that ship with the
+# repo.  Negation pattern lets us re-include it without losing the
+# above rules.
+!examples/
 tests/quick_test_dataset.jsonl
 tests/sample_dataset.jsonl
 run_datagen_kimik2-thinking.sh
