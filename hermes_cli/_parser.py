@@ -109,6 +109,19 @@ def build_top_level_parser():
             "auto-bypassed. Intended for scripts / pipes."
         ),
     )
+    parser.add_argument(
+        "--output-format",
+        choices=("text", "json"),
+        default="text",
+        help=(
+            "Output format for -z / --oneshot. 'text' (default) emits "
+            "just the final response. 'json' emits a structured envelope "
+            "with final_response, model, provider, token counts, "
+            "estimated cost, verification status (if applicable), and "
+            "rework_message. Use json in CI / scripts that need to gate "
+            "on verifier outcomes or read token budgets."
+        ),
+    )
     # --model / --provider are accepted at the top level so they can pair
     # with -z without needing the `chat` subcommand.  If neither -z nor a
     # subcommand consumes them, they fall through harmlessly as None.
