@@ -71,9 +71,15 @@ DEFAULT_PLAN_MODE_ALLOWLIST: frozenset[str] = frozenset({
     # Plan-time planning helpers
     "todo",
     "clarify",
-    # Delegation is allowed only when the subagent is also in plan mode
-    # (the integration enforces that at dispatch time).
-    "delegate_task",
+    # NOTE: delegate_task is deliberately NOT on the allowlist.  The
+    # child AIAgent that delegate_task spawns is constructed with a
+    # fresh PlanModeState(enabled=False), so allowing delegation
+    # during /plan would be a read-only escape hatch — the subagent
+    # would have full mutating-tool access while the parent appears
+    # to be in Plan Mode.  If you need parallel investigation during
+    # planning, do it inline (the parent has plenty of read-only
+    # tools); cross-agent parallel planning is a future feature that
+    # needs plan-mode propagation in delegate_tool.
 })
 
 
@@ -329,7 +335,8 @@ PLAN_MODE_SYSTEM_PROMPT = """\
 You are in **Plan Mode**.  You may only call read-only tools (read_file,
 list_directory, search_files, web_search, web_fetch, session_search,
 session_insights, skill_search, skill_browse, skill_view, memory READ,
-todo, clarify, delegate_task).  Any other tool will be refused.
+todo, clarify).  Any other tool — including ``delegate_task``, because
+it spawns an unrestricted subagent — will be refused.
 
 Your job in Plan Mode is to produce a structured plan that, once approved,
 the agent will execute end-to-end in Act Mode.  Use `write_file` is NOT

@@ -12,7 +12,7 @@ is on, the dispatcher refuses any tool that isn't on the read-only
 allowlist (`read_file`, `list_directory`, `search_files`, `web_search`,
 `web_fetch`, `session_search`, `session_insights`, `skill_search`,
 `skill_browse`, `skill_view`, `memory` in read modes, `todo`, `clarify`,
-`delegate_task`).  Anything else — `write_file`, `patch`, `terminal`,
+`todo`, `clarify`).  Anything else — `write_file`, `patch`, `terminal`,
 `send_message`, browser POSTs, image generation — returns a refusal
 that tells the model exactly why and what to do next.
 
@@ -127,7 +127,8 @@ plan_mode:
 | `skill_search`, `skill_browse`, `skill_view` | `image_generate`, `tts_speak`  |
 | `memory` (`read` / `list` / `get` only)    | `memory` (`write` / `delete`)    |
 | `todo`, `clarify`                          | `cronjob_create`, `kanban_create`|
-| `delegate_task`                            | `skill_install`, `skill_delete`  |
+|                                            | `skill_install`, `skill_delete`  |
+|                                            | `delegate_task` (would spawn an unrestricted subagent) |
 
 The refusal payload is shaped to be useful to the model rather than
 opaque:

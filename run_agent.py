@@ -5835,14 +5835,30 @@ class AIAgent:
 
     def _call_verifier_llm(self, messages: list, *, model: Optional[str],
                            provider: Optional[str], max_tokens: int) -> str:
-        """Mockable seam for the verifier model call.  Returns raw text."""
+        """Mockable seam for the verifier model call.  Returns raw text.
+
+        Threads the agent's main_runtime (base_url, api_key, api_mode,
+        provider, model) through to call_llm so the verifier inherits
+        the same endpoint and credentials as the executor — without
+        this, an agent on a custom base_url / OAuth provider would
+        have the verifier auto-resolve a *different* endpoint from
+        config/env, or fail outright when creds were passed at
+        construction rather than living in config.
+        """
         from agent.auxiliary_client import call_llm
+        # Inherit the agent's runtime by default; only the explicit
+        # provider/model overrides from verification.* config win.
+        try:
+            runtime = self._current_main_runtime()
+        except Exception:
+            runtime = None
         response = call_llm(
             provider=provider,
             model=model or self.model,
             messages=messages,
             temperature=0.0,
             max_tokens=max_tokens,
+            main_runtime=runtime,
         )
         try:
             return (response.choices[0].message.content or "").strip()

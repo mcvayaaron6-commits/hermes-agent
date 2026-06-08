@@ -55,8 +55,17 @@ def test_allows_readonly_tools_when_enabled():
                  "web_search", "web_fetch",
                  "session_search", "session_insights",
                  "skill_search", "skill_browse", "skill_view",
-                 "memory_read", "todo", "clarify", "delegate_task"):
+                 "memory_read", "todo", "clarify"):
         assert state.is_tool_allowed(tool), tool
+
+
+def test_delegate_task_blocked_in_plan_mode():
+    """delegate_task must be blocked because its spawned child agent
+    does NOT inherit plan mode — letting it through would be a
+    read-only escape hatch."""
+    state = PlanModeState()
+    state.enter(task="x", plan_path=Path("p.md"))
+    assert not state.is_tool_allowed("delegate_task")
 
 
 def test_action_filter_memory():
