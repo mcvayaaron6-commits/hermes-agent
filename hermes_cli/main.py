@@ -9291,7 +9291,8 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "dump", "fallback", "gateway", "hooks", "import", "insights",
         "kanban", "login", "logout", "logs", "lsp", "mcp", "memory",
         "model", "orchestrate", "pairing", "plugins", "profile", "sessions",
-        "setup", "skills", "slack", "status", "tools", "uninstall", "update",
+        "setup", "skills", "slack", "status", "superagent", "tools",
+        "uninstall", "update",
         "version", "webhook", "whatsapp", "chat",
         # Help-ish invocations — plugin commands not being listed in
         # top-level --help is an acceptable trade-off for skipping an
@@ -9495,6 +9496,68 @@ def main():
             dry_run=args.dry_run,
         )
     orchestrate_parser.set_defaults(func=_cmd_orchestrate)
+
+    # ---- superagent: end-to-end synthesis of plan + DAG + verify + lessons ----
+    superagent_parser = subparsers.add_parser(
+        "superagent",
+        help=(
+            "End-to-end synthesis: planner decomposes a task into a DAG, "
+            "orchestrator executes it in parallel, verifier gates each "
+            "task, lessons are captured, promotion nudges surface."
+        ),
+        description=(
+            "The one-command demonstration of the whole stack.  Given a "
+            "task, the planner produces a YAML DAG of subtasks.  The "
+            "orchestrator dispatches them in parallel with file-lock "
+            "arbitration.  Each subtask is verified.  Lessons captured "
+            "from rework cycles get the auto-promotion engine running.  "
+            "Emits a JSON envelope with per-task results, costs, and "
+            "any promotion candidates that surfaced."
+        ),
+    )
+    superagent_parser.add_argument(
+        "task", help="The task to complete end-to-end",
+    )
+    superagent_parser.add_argument(
+        "--output-format",
+        choices=("text", "json"),
+        default="text",
+        help=(
+            "Output format.  'text' (default) emits a human summary; "
+            "'json' emits the structured envelope for CI / scripts."
+        ),
+    )
+    superagent_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        help=(
+            "Run the planner only; print the DAG it produces without "
+            "dispatching any agents.  Useful for sanity-checking the "
+            "planner's decomposition before paying for execution."
+        ),
+    )
+    superagent_parser.add_argument(
+        "--model",
+        default=None,
+        help="Override the model for both planner and executors.",
+    )
+    superagent_parser.add_argument(
+        "--provider",
+        default=None,
+        help="Override the provider (e.g. anthropic, openai, openrouter).",
+    )
+
+    def _cmd_superagent(args):
+        from hermes_cli.superagent import run_superagent
+        return run_superagent(
+            args.task,
+            output_format=args.output_format,
+            dry_run=args.dry_run,
+            model=args.model,
+            provider=args.provider,
+        )
+    superagent_parser.set_defaults(func=_cmd_superagent)
 
     from hermes_cli.fallback_cmd import cmd_fallback
 
