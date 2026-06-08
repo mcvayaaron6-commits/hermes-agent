@@ -699,6 +699,19 @@ DEFAULT_CONFIG = {
         "deny_tools": [],
     },
 
+    # Audit log — structured JSONL record of every hook fire, plan-mode
+    # transition, and verifier verdict.  Off by default; turn on for
+    # production observability or post-mortem debugging.  See
+    # agent/audit_log.py for the schema.
+    "audit": {
+        # Master switch.  When false (default), audit writes are no-ops.
+        "enabled": False,
+        # Optional override for the log file path.  Defaults to
+        # <hermes_home>/logs/audit.jsonl.  Use an absolute path here
+        # if you want to ship logs to a different mount.
+        "path": None,
+    },
+
     # Named subagent profiles — operator-level controls.  See
     # website/docs/user-guide/features/subagents.md.  Profiles live as
     # markdown-with-frontmatter files under ~/.hermes/agents/ (user-

@@ -4755,6 +4755,15 @@ class HermesCLI:
         plans_dir = cwd / ".hermes" / "plans"
         plan_path = default_plan_path(plans_dir, task)
         plan_mode.enter(task=task, plan_path=plan_path)
+        try:
+            from agent import audit_log
+            audit_log.write_event(
+                audit_log.EVENT_PLAN_MODE_ENTER,
+                session_id=str(getattr(self.agent, "session_id", "") or ""),
+                data={"task": task, "plan_path": str(plan_path)},
+            )
+        except Exception:
+            pass
         print(f"  📋 Plan Mode active — read-only tools only.")
         print(f"     Task: {task}")
         print(f"     Plan will be saved to: {plan_path}")
@@ -4823,6 +4832,19 @@ class HermesCLI:
                 logger.debug("could not seed todos from plan: %s", exc)
         finally:
             plan_mode.exit()
+        try:
+            from agent import audit_log
+            audit_log.write_event(
+                audit_log.EVENT_PLAN_MODE_EXIT,
+                session_id=str(getattr(self.agent, "session_id", "") or ""),
+                data={
+                    "task": plan_mode.task,
+                    "plan_path": str(plan_path) if plan_path else None,
+                    "steps_seeded": todos_seeded,
+                },
+            )
+        except Exception:
+            pass
         if plan_path is not None:
             print(f"  ✅ Plan saved: {plan_path}")
         print(f"  ▶ Act Mode active — full toolset restored.")

@@ -382,6 +382,29 @@ _DESTRUCTIVE_PATTERNS = re.compile(
 _REDIRECT_OVERWRITE = re.compile(r'[^>]>[^>]|^>[^>]')
 
 
+def _audit_verification_event(agent, report) -> None:
+    """Write a Verification event to the audit log.  Best-effort.
+
+    Module-level (not a method) so unit tests can call _run_verifier
+    against a stub agent without binding every helper.  No-ops if the
+    audit log import or write fails.
+    """
+    try:
+        from agent import audit_log
+        audit_log.write_event(
+            audit_log.EVENT_VERIFICATION,
+            session_id=str(getattr(agent, "session_id", "") or ""),
+            data={
+                "status": report.status,
+                "summary": report.summary[:512],
+                "issue_count": len(report.issues),
+                "attempts": report.attempts,
+            },
+        )
+    except Exception:
+        pass
+
+
 def _is_destructive_command(cmd: str) -> bool:
     """Heuristic: does this terminal command look like it modifies/deletes files?"""
     if not cmd:
@@ -5917,11 +5940,15 @@ class AIAgent:
             )
         except Exception as exc:
             logger.warning("verifier dispatch failed: %s", exc)
-            return VerificationReport(
+            report = VerificationReport(
                 status=STATUS_ERROR,
                 summary=f"verifier dispatch failed: {exc}",
             )
-        return parse_verification_response(response_text)
+            _audit_verification_event(self, report)
+            return report
+        report = parse_verification_response(response_text)
+        _audit_verification_event(self, report)
+        return report
 
     def _get_hook_registry(self):
         """Lazy-load the user-defined hook registry on first use.
@@ -5978,7 +6005,24 @@ class AIAgent:
         else in production, this method also dispatches via the plugin
         manager's ``invoke_hook`` so shell_hooks and Python plugins see
         them too.  See ``_HOOK_BRIDGE`` for the mapping rationale.
+
+        Also writes one structured line to the audit log (when
+        ``audit.enabled: true``) so operators get a JSONL record of
+        every fired event.  Audit writes are best-effort and never
+        propagate failures.
         """
+        # Audit-log the event before dispatching hooks — even a
+        # hook-disabled session benefits from the trace.
+        try:
+            from agent import audit_log
+            audit_log.write_event(
+                event,
+                session_id=str(getattr(self, "session_id", "") or ""),
+                data={k: v for k, v in payload.items() if v is not None},
+            )
+        except Exception:
+            pass
+
         try:
             from agent.hooks import HookOutcome, run_hooks
         except Exception as exc:
