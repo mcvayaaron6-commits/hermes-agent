@@ -5009,6 +5009,66 @@ class HermesCLI:
         except Exception as exc:
             print(f"  Verification failed: {exc}")
 
+    def _handle_audit_command(self, command: str) -> None:
+        """Inspect the structured audit log of lifecycle events.
+
+        Syntax:
+            /audit                — show last 20 events
+            /audit tail [N]       — show last N events (default 20)
+            /audit summary        — count by event type
+            /audit path           — print the resolved log path
+        """
+        from agent import audit_log
+        parts = command.split(None, 2)
+        sub = (parts[1].strip().lower() if len(parts) > 1 else "tail")
+
+        if sub == "path":
+            print(f"  📁 {audit_log._resolve_log_path()}")
+            cfg = audit_log._audit_config()
+            print(f"  enabled: {cfg.get('enabled', False)}")
+            return
+
+        if sub == "summary":
+            counts = audit_log.count_events_by_type()
+            if not counts:
+                print("  No audit events recorded.")
+                print(f"  Enable with audit.enabled: true in ~/.hermes/config.yaml.")
+                return
+            total = sum(counts.values())
+            print(f"  📊 {total} audit event(s):")
+            for event, count in sorted(counts.items(), key=lambda kv: -kv[1]):
+                bar = "█" * min(40, count)
+                print(f"    {event:<24} {count:>5}  {bar}")
+            return
+
+        # Default: tail
+        try:
+            n = int(parts[2]) if len(parts) > 2 else 20
+        except ValueError:
+            try:
+                n = int(parts[1]) if sub.isdigit() else 20
+            except (ValueError, IndexError):
+                n = 20
+        events = audit_log.tail_events(n=n)
+        if not events:
+            print("  No audit events recorded.")
+            print(f"  Enable with audit.enabled: true in ~/.hermes/config.yaml.")
+            print(f"  Log path: {audit_log._resolve_log_path()}")
+            return
+        print(f"  📋 Last {len(events)} audit event(s):")
+        for e in events:
+            ts = (e.get("ts") or "")[:19].replace("T", " ")
+            session = (e.get("session_id") or "")[:12]
+            event = e.get("event") or "<unknown>"
+            data = e.get("data") or {}
+            # Compact one-line summary of the data dict
+            data_preview = ", ".join(
+                f"{k}={str(v)[:24]}" for k, v in list(data.items())[:3]
+            )
+            if len(data) > 3:
+                data_preview += f", +{len(data)-3} more"
+            print(f"    {ts}  [{session:>12}]  {event:<20}  {data_preview}")
+
     def _handle_subagents_command(self, command: str) -> None:
         """List, reload, or inspect named subagent profiles.
 
@@ -7933,6 +7993,8 @@ class HermesCLI:
             self._handle_verify_command()
         elif canonical == "subagents":
             self._handle_subagents_command(cmd_original)
+        elif canonical == "audit":
+            self._handle_audit_command(cmd_original)
         elif canonical == "snapshot":
             self._handle_snapshot_command(cmd_original)
         elif canonical == "stop":

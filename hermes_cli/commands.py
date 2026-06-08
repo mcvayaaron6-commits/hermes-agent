@@ -102,6 +102,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("subagents", "List named subagent profiles (from ~/.hermes/agents and .hermes/agents)",
                "Configuration", aliases=("profiles",), args_hint="[reload|show <name>]",
                cli_only=True),
+    CommandDef("audit", "Inspect the structured audit log of hook/verifier/plan events",
+               "Info", args_hint="[tail [N]|summary|path]", cli_only=True),
     CommandDef("snapshot", "Create or restore state snapshots of Hermes config/state", "Session",
                cli_only=True, aliases=("snap",), args_hint="[create|restore <id>|prune]"),
     CommandDef("stop", "Kill all running background processes", "Session"),
