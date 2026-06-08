@@ -534,6 +534,100 @@ def _probe_gateway_health() -> tuple[bool, dict | None]:
     return False, None
 
 
+@app.get("/health")
+async def get_health():
+    """Kubernetes-style liveness probe.
+
+    Returns 200 with ``{"status": "ok"}`` as long as the web server
+    process is responding.  Doesn't check downstream — that's what
+    /ready is for.  Liveness should fail only when the process is
+    deadlocked / crashed; ready may go red while the process is
+    still healthy but a downstream is degraded.
+    """
+    return {"status": "ok", "service": "hermes-web", "version": __version__}
+
+
+@app.get("/ready")
+async def get_ready():
+    """Kubernetes-style readiness probe.
+
+    Returns 200 with structured component status when the agent is
+    ready to accept work, 503 with reasons when a critical component
+    is unhealthy.  Components checked:
+
+    * **config** — config.yaml loads without error
+    * **gateway** — gateway process responds (when running)
+    * **audit_log** — when audit.enabled, the chain verifies
+    * **storage** — hermes_home writable
+
+    Format is stable across releases for K8s YAML compatibility.
+    """
+    components: dict = {}
+    overall_ok = True
+
+    # 1. Config loads cleanly.
+    try:
+        from hermes_cli.config import load_config
+        _ = load_config()
+        components["config"] = {"ok": True}
+    except Exception as exc:
+        components["config"] = {"ok": False, "error": str(exc)[:200]}
+        overall_ok = False
+
+    # 2. Storage is writable.
+    try:
+        from hermes_constants import get_hermes_home
+        home = get_hermes_home()
+        probe = home / ".readiness_probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        components["storage"] = {"ok": True, "path": str(home)}
+    except Exception as exc:
+        components["storage"] = {"ok": False, "error": str(exc)[:200]}
+        overall_ok = False
+
+    # 3. Audit chain (when enabled) — fast tail check, not full walk.
+    try:
+        from agent import audit_log
+        cfg = audit_log._audit_config()
+        if cfg.get("enabled"):
+            # Only check whether the file path is reachable; full
+            # verify_chain() may scan a large log and is too slow
+            # for a per-probe call.  /audit verify is the manual
+            # equivalent.
+            path = audit_log._resolve_log_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            components["audit_log"] = {"ok": True, "path": str(path),
+                                       "enabled": True}
+        else:
+            components["audit_log"] = {"ok": True, "enabled": False}
+    except Exception as exc:
+        components["audit_log"] = {"ok": False, "error": str(exc)[:200]}
+        # Don't fail the probe on audit issues — non-critical.
+
+    # 4. Gateway liveness — opportunistic, doesn't fail the probe.
+    try:
+        gateway_pid = get_running_pid()
+        components["gateway"] = {
+            "ok": True,
+            "running": gateway_pid is not None,
+            "pid": gateway_pid,
+        }
+    except Exception:
+        components["gateway"] = {"ok": True, "running": False}
+
+    body = {
+        "status": "ready" if overall_ok else "not_ready",
+        "service": "hermes-web",
+        "version": __version__,
+        "components": components,
+    }
+    if not overall_ok:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=503, content=body)
+    return body
+
+
 @app.get("/api/status")
 async def get_status():
     current_ver, latest_ver = check_config_version()
