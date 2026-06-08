@@ -5015,6 +5015,74 @@ class HermesCLI:
         except Exception as exc:
             print(f"  Verification failed: {exc}")
 
+    def _handle_promotions_command(self, command: str) -> None:
+        """Review auto-promotion candidates from clustered lessons.
+
+        Syntax:
+            /promotions               — list candidates (no install)
+            /promotions list          — alias of bare /promotions
+            /promotions install <name>
+                                      — install a single candidate by name
+            /promotions install-all   — install every candidate (skips
+                                        any whose target already exists)
+        """
+        from agent import skill_promotion as _sp
+        parts = command.split(None, 2)
+        sub = (parts[1].strip().lower() if len(parts) > 1 else "list")
+
+        candidates = _sp.find_skill_candidates()
+        candidates = _sp.filter_already_installed(candidates)
+
+        if not candidates:
+            print("  📦 No promotion candidates yet.")
+            print("  Skills are auto-proposed when ≥ 3 lessons share ≥ 2 tags.")
+            print("  Build up the corpus by letting the verifier catch reworks.")
+            return
+
+        if sub in ("list", ""):
+            print(f"  📦 {len(candidates)} promotion candidate(s):")
+            for c in candidates:
+                tags = ",".join(c.shared_tags[:5])
+                print(f"    {c.name:<32}  score={c.score:5.1f}  "
+                      f"tags={tags}")
+                print(f"      ↳ {c.description}")
+            print()
+            print("  Install one: /promotions install <name>")
+            print("  Install all: /promotions install-all")
+            return
+
+        if sub == "install-all":
+            installed: list = []
+            for c in candidates:
+                try:
+                    path = _sp.install_candidate(c)
+                    installed.append((c.name, path))
+                except Exception as exc:
+                    print(f"  ❌ {c.name}: install failed — {exc}")
+            print(f"  ✅ Installed {len(installed)} candidate(s):")
+            for name, path in installed:
+                print(f"    {name}  →  {path}")
+            return
+
+        if sub == "install":
+            target_name = parts[2].strip() if len(parts) > 2 else ""
+            if not target_name:
+                print("  Usage: /promotions install <name>")
+                return
+            match = next((c for c in candidates if c.name == target_name), None)
+            if match is None:
+                available = ", ".join(c.name for c in candidates[:10])
+                print(f"  No candidate named {target_name!r}. Available: {available}")
+                return
+            try:
+                path = _sp.install_candidate(match)
+                print(f"  ✅ Installed {match.name}  →  {path}")
+            except Exception as exc:
+                print(f"  ❌ Install failed: {exc}")
+            return
+
+        print(f"  Unknown subcommand: {sub!r}. Use list / install / install-all.")
+
     def _handle_lessons_command(self, command: str) -> None:
         """Browse lessons learned from past verifier rework cycles.
 
@@ -8087,6 +8155,8 @@ class HermesCLI:
             self._handle_audit_command(cmd_original)
         elif canonical == "lessons":
             self._handle_lessons_command(cmd_original)
+        elif canonical == "promotions":
+            self._handle_promotions_command(cmd_original)
         elif canonical == "snapshot":
             self._handle_snapshot_command(cmd_original)
         elif canonical == "stop":

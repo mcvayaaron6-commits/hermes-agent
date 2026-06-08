@@ -723,6 +723,25 @@ DEFAULT_CONFIG = {
         "hmac_key_file": None,
     },
 
+    # Auto-skill-promotion thresholds — the compounding-intelligence
+    # engine that elevates clustered lessons into reusable skills, and
+    # heavily-used skills into specialised subagent profiles.  See
+    # agent/skill_promotion.py and
+    # website/docs/user-guide/features/skill-promotion.md.
+    "skill_promotion": {
+        # Minimum lessons that must cluster (share min_shared_tags
+        # tags pairwise) before a skill is proposed.  Below this,
+        # the pattern is too weak a signal to promote.
+        "lesson_threshold": 3,
+        # Minimum tag overlap required for two lessons to be in the
+        # same cluster.  Higher = stricter clustering, fewer but
+        # more specific promotions.
+        "min_shared_tags": 2,
+        # Minimum successful uses of a skill before it's proposed
+        # for promotion into a subagent profile.
+        "usage_threshold": 5,
+    },
+
     # Named subagent profiles — operator-level controls.  See
     # website/docs/user-guide/features/subagents.md.  Profiles live as
     # markdown-with-frontmatter files under ~/.hermes/agents/ (user-
