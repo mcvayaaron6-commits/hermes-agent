@@ -11087,6 +11087,19 @@ class HermesCLI:
                     print(f"  🔁 Verifier requested rework "
                           f"(attempt {self._verification_rework_count}/{max_attempts})")
                     try:
+                        from agent import audit_log
+                        audit_log.write_event(
+                            audit_log.EVENT_REWORK_INJECTED,
+                            session_id=str(getattr(self.agent, "session_id", "") or ""),
+                            data={
+                                "attempt": self._verification_rework_count,
+                                "max_attempts": max_attempts,
+                                "reason": (result.get("verification", {}) or {}).get("summary", ""),
+                            },
+                        )
+                    except Exception:
+                        pass
+                    try:
                         self._pending_input.put(result["rework_message"])
                     except Exception as exc:
                         logger.debug("could not queue rework message: %s", exc)
