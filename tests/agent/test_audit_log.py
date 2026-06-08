@@ -182,9 +182,12 @@ def test_format_line_includes_required_keys(enabled):
     parsed = json.loads(line)
     assert set(parsed.keys()) == {
         "ts", "session_id", "event", "agent", "hermes_version", "data",
+        "prev_hash",
     }
     assert parsed["agent"] == "subagent"
     assert parsed["hermes_version"] == "0.13.0"
+    # Default prev_hash is the genesis sentinel.
+    assert parsed["prev_hash"] == al.GENESIS_PREV_HASH
 
 
 def test_format_line_handles_unicode(enabled):
@@ -206,3 +209,164 @@ def test_resolve_log_path_uses_explicit_when_provided(monkeypatch, tmp_path):
     monkeypatch.setattr(al, "_audit_config",
                         lambda: {"enabled": True, "path": str(explicit)})
     assert al._resolve_log_path() == explicit.resolve()
+
+
+# ---------------------------------------------------------------------------
+# Hash-chain + HMAC tamper evidence
+# ---------------------------------------------------------------------------
+
+
+def test_chain_first_line_starts_at_genesis(enabled):
+    al._reset_chain_state()
+    al.write_event("first", session_id="s", data={"i": 1}, path=enabled)
+    line = json.loads(enabled.read_text(encoding="utf-8").strip())
+    assert line["prev_hash"] == al.GENESIS_PREV_HASH
+
+
+def test_chain_subsequent_lines_link_to_prior(enabled):
+    al._reset_chain_state()
+    al.write_event("a", session_id="s", data={"i": 1}, path=enabled)
+    al.write_event("b", session_id="s", data={"i": 2}, path=enabled)
+    al.write_event("c", session_id="s", data={"i": 3}, path=enabled)
+    lines = [json.loads(l) for l in enabled.read_text(encoding="utf-8").splitlines()]
+    assert lines[0]["prev_hash"] == al.GENESIS_PREV_HASH
+    # Each prev_hash matches hash of prior raw line.
+    raw_lines = enabled.read_text(encoding="utf-8").splitlines()
+    for i in range(1, len(raw_lines)):
+        expected = al._line_hash(raw_lines[i - 1])
+        actual = lines[i]["prev_hash"]
+        assert expected == actual, f"line {i}: prev_hash mismatch"
+
+
+def test_verify_chain_intact(enabled):
+    al._reset_chain_state()
+    for i in range(5):
+        al.write_event("E", session_id="s", data={"i": i}, path=enabled)
+    result = al.verify_chain(path=enabled)
+    assert result.ok
+    assert result.lines_total == 5
+    assert result.lines_ok == 5
+    assert result.first_bad_line is None
+
+
+def test_verify_chain_detects_truncated_front(enabled):
+    al._reset_chain_state()
+    for i in range(3):
+        al.write_event("E", session_id="s", data={"i": i}, path=enabled)
+    # Attacker deletes the first line.
+    lines = enabled.read_text(encoding="utf-8").splitlines()
+    enabled.write_text("\n".join(lines[1:]) + "\n", encoding="utf-8")
+    result = al.verify_chain(path=enabled)
+    assert not result.ok
+    assert result.first_bad_line == 1
+    assert "prev_hash" in result.failure_reason.lower()
+
+
+def test_verify_chain_detects_edited_middle(enabled):
+    al._reset_chain_state()
+    for i in range(5):
+        al.write_event("E", session_id="s", data={"i": i}, path=enabled)
+    # Attacker rewrites line 2.
+    lines = enabled.read_text(encoding="utf-8").splitlines()
+    edited = json.loads(lines[1])
+    edited["data"]["i"] = 999
+    lines[1] = json.dumps(edited, ensure_ascii=False)
+    enabled.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    result = al.verify_chain(path=enabled)
+    assert not result.ok
+    # Line 2 itself still has the correct prev_hash, but line 3's
+    # prev_hash no longer matches the (now-edited) line 2's hash.
+    assert result.first_bad_line == 3
+
+
+def test_verify_chain_detects_deleted_middle(enabled):
+    al._reset_chain_state()
+    for i in range(5):
+        al.write_event("E", session_id="s", data={"i": i}, path=enabled)
+    lines = enabled.read_text(encoding="utf-8").splitlines()
+    del lines[2]  # remove line 3
+    enabled.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    result = al.verify_chain(path=enabled)
+    assert not result.ok
+    assert result.first_bad_line is not None
+
+
+def test_verify_chain_malformed_line_caught(enabled):
+    al._reset_chain_state()
+    al.write_event("a", session_id="s", data={"i": 1}, path=enabled)
+    with enabled.open("a", encoding="utf-8") as fh:
+        fh.write("not json at all\n")
+    result = al.verify_chain(path=enabled)
+    assert not result.ok
+    assert "JSON" in result.failure_reason
+
+
+def test_hmac_signing_when_key_supplied(enabled, monkeypatch):
+    al._reset_chain_state()
+    monkeypatch.setenv("HERMES_AUDIT_HMAC_KEY", "deadbeef" * 8)
+    al.write_event("E", session_id="s", data={"i": 1}, path=enabled)
+    line = json.loads(enabled.read_text(encoding="utf-8").strip())
+    assert "sig" in line
+    assert len(line["sig"]) == 64  # SHA-256 hex
+
+
+def test_hmac_omitted_when_no_key(enabled, monkeypatch):
+    al._reset_chain_state()
+    monkeypatch.delenv("HERMES_AUDIT_HMAC_KEY", raising=False)
+    al.write_event("E", session_id="s", data={"i": 1}, path=enabled)
+    line = json.loads(enabled.read_text(encoding="utf-8").strip())
+    assert "sig" not in line
+
+
+def test_verify_chain_hmac_match(enabled, monkeypatch):
+    al._reset_chain_state()
+    key_hex = "0123456789abcdef" * 4
+    monkeypatch.setenv("HERMES_AUDIT_HMAC_KEY", key_hex)
+    for i in range(3):
+        al.write_event("E", session_id="s", data={"i": i}, path=enabled)
+    result = al.verify_chain(path=enabled)
+    assert result.ok
+    assert result.sig_checked
+    assert result.sig_ok == 3
+
+
+def test_verify_chain_hmac_mismatch_detected(enabled, monkeypatch):
+    al._reset_chain_state()
+    monkeypatch.setenv("HERMES_AUDIT_HMAC_KEY", "aa" * 32)
+    for i in range(3):
+        al.write_event("E", session_id="s", data={"i": i}, path=enabled)
+    # Attacker tampers with content AND fixes the prev_hash chain
+    # (recomputes hashes downstream), but DOESN'T have the HMAC key.
+    lines = enabled.read_text(encoding="utf-8").splitlines()
+    line_dict = json.loads(lines[1])
+    line_dict["data"]["i"] = 999
+    # Note: attacker can't recompute the sig without the key.
+    # They might leave the old sig (HMAC check fails) or omit it.
+    # Either way, verification detects.
+    lines[1] = json.dumps(line_dict, ensure_ascii=False)
+    # Recompute prev_hashes downstream so the chain itself passes.
+    for j in range(2, len(lines)):
+        downstream = json.loads(lines[j])
+        downstream["prev_hash"] = al._line_hash(lines[j - 1])
+        lines[j] = json.dumps(downstream, ensure_ascii=False)
+    enabled.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    result = al.verify_chain(path=enabled)
+    assert not result.ok
+    assert "HMAC" in result.failure_reason or "signature" in result.failure_reason
+
+
+def test_verify_chain_missing_file(tmp_path):
+    result = al.verify_chain(path=tmp_path / "missing.jsonl")
+    assert not result.ok
+    assert "not found" in result.failure_reason
+
+
+def test_signing_key_from_file(enabled, monkeypatch, tmp_path):
+    al._reset_chain_state()
+    monkeypatch.delenv("HERMES_AUDIT_HMAC_KEY", raising=False)
+    key_file = tmp_path / "audit.key"
+    key_file.write_bytes(b"my-secret-key-bytes")
+    monkeypatch.setattr(al, "_audit_config",
+                        lambda: {"enabled": True, "hmac_key_file": str(key_file)})
+    key = al._signing_key()
+    assert key == b"my-secret-key-bytes"

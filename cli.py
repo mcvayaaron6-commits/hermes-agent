@@ -5099,6 +5099,25 @@ class HermesCLI:
             print(f"  enabled: {cfg.get('enabled', False)}")
             return
 
+        if sub == "verify":
+            # Tamper-evidence check: walk the prev_hash chain and (if
+            # an HMAC key is configured) verify every line's signature.
+            result = audit_log.verify_chain()
+            if result.ok:
+                print(f"  ✅ Chain intact — {result.lines_ok}/{result.lines_total} line(s) verified.")
+                if result.sig_checked:
+                    print(f"  🔐 HMAC: {result.sig_ok} signed, "
+                          f"{result.sig_missing} unsigned.")
+                else:
+                    print("  ℹ Chain only (no HMAC key configured). "
+                          "Set HERMES_AUDIT_HMAC_KEY for cryptographic signing.")
+            else:
+                print(f"  ❌ Chain broken — {result.failure_reason}")
+                if result.first_bad_line is not None:
+                    print(f"     First bad line: {result.first_bad_line}")
+                print(f"     Lines verified before break: {result.lines_ok}")
+            return
+
         if sub == "summary":
             counts = audit_log.count_events_by_type()
             if not counts:

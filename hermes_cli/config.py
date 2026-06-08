@@ -710,6 +710,17 @@ DEFAULT_CONFIG = {
         # <hermes_home>/logs/audit.jsonl.  Use an absolute path here
         # if you want to ship logs to a different mount.
         "path": None,
+        # Path to a file containing the HMAC signing key.  When set
+        # (or HERMES_AUDIT_HMAC_KEY env var is set), every audit line
+        # is HMAC-SHA256 signed over (prev_hash + content).  Verify
+        # via /audit verify or programmatically with
+        # agent.audit_log.verify_chain(signing_key=...).
+        #
+        # The chain (prev_hash linking) is always active when audit
+        # is enabled — even without a key it detects truncation,
+        # reordering, and edits.  HMAC raises the bar to "attacker
+        # must also have the key."
+        "hmac_key_file": None,
     },
 
     # Named subagent profiles — operator-level controls.  See
