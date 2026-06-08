@@ -300,6 +300,7 @@ def test_main_top_level_oneshot_accepts_toolsets(monkeypatch, main_mod):
         "toolsets": "web,terminal",
         "output_format": "text",
         "fail_on_rework": True,
+        "auto_rework": False,
     }
 
 

@@ -128,6 +128,7 @@ def run_oneshot(
     toolsets: object = None,
     output_format: str = "text",
     fail_on_rework: bool = True,
+    auto_rework: bool = False,
 ) -> int:
     """Execute a single prompt and print the final content block.
 
@@ -182,7 +183,19 @@ def run_oneshot(
     devnull = open(os.devnull, "w", encoding="utf-8")
 
     want_json = (output_format or "text").lower() == "json"
+    if auto_rework and not want_json:
+        # Auto-rework only makes sense when the caller is reading the
+        # structured envelope.  In text mode the loop has no caller to
+        # decide on the rework, so this combination is almost certainly
+        # a flag mistake — warn and ignore rather than silently looping.
+        sys.stderr.write(
+            "hermes -z: --auto-rework requires --output-format json; "
+            "ignoring auto-rework (text mode emits the final response "
+            "regardless of verification state).\n"
+        )
+        auto_rework = False
     result_dict: Optional[dict] = None
+    rework_history: list = []
     try:
         with redirect_stdout(devnull), redirect_stderr(devnull):
             if want_json:
@@ -193,6 +206,37 @@ def run_oneshot(
                     toolsets=explicit_toolsets,
                     use_config_toolsets=use_config_toolsets,
                 )
+                # Auto-rework loop: while the verifier surfaces
+                # NEEDS_REWORK and we still have attempts left, re-run
+                # with the rework_message as the next user turn.  The
+                # rework_history list tracks each attempt's verifier
+                # verdict + token cost so the final envelope tells the
+                # caller exactly how many cycles it took.
+                if auto_rework:
+                    max_attempts = _resolve_auto_rework_max_attempts()
+                    attempt = 1
+                    while (
+                        attempt < max_attempts
+                        and isinstance(result_dict, dict)
+                        and (result_dict.get("verification") or {}).get("status") == "NEEDS_REWORK"
+                        and result_dict.get("rework_message")
+                    ):
+                        rework_history.append({
+                            "attempt": attempt,
+                            "verification": dict(result_dict.get("verification") or {}),
+                            "input_tokens": result_dict.get("input_tokens"),
+                            "output_tokens": result_dict.get("output_tokens"),
+                            "estimated_cost_usd": result_dict.get("estimated_cost_usd"),
+                        })
+                        next_prompt = result_dict["rework_message"]
+                        response, result_dict = _run_agent_with_details(
+                            next_prompt,
+                            model=model,
+                            provider=provider,
+                            toolsets=explicit_toolsets,
+                            use_config_toolsets=use_config_toolsets,
+                        )
+                        attempt += 1
             else:
                 response = _run_agent(
                     prompt,
@@ -210,6 +254,9 @@ def run_oneshot(
     if want_json:
         import json as _json
         envelope = _build_json_envelope(prompt, response, result_dict)
+        if rework_history:
+            envelope["rework_history"] = rework_history
+            envelope["total_attempts"] = len(rework_history) + 1
         real_stdout.write(_json.dumps(envelope, ensure_ascii=False, default=str))
         real_stdout.write("\n")
         real_stdout.flush()
@@ -227,6 +274,16 @@ def run_oneshot(
             real_stdout.write("\n")
         real_stdout.flush()
     return 0
+
+
+def _resolve_auto_rework_max_attempts() -> int:
+    """Read verification.max_attempts from config; default 2."""
+    try:
+        from hermes_cli.config import load_config
+        cfg = (load_config().get("verification") or {})
+        return max(1, int(cfg.get("max_attempts", 2)))
+    except Exception:
+        return 2
 
 
 def _build_json_envelope(prompt: str, response: str, result: Optional[dict]) -> dict:

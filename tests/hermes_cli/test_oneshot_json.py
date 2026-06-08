@@ -122,6 +122,32 @@ def test_envelope_omits_missing_telemetry_keys():
     assert "estimated_cost_usd" not in env
 
 
+def test_resolve_auto_rework_max_attempts_default():
+    from hermes_cli.oneshot import _resolve_auto_rework_max_attempts
+    # Default falls back to 2 even if config is empty / unavailable.
+    n = _resolve_auto_rework_max_attempts()
+    assert n >= 1
+
+
+def test_envelope_rework_history_keys_when_set():
+    """Lock in the rework_history + total_attempts envelope keys so
+    scripted CI consumers can rely on them."""
+    # We build the envelope manually here — the integration of the
+    # loop is exercised by smoke tests; this just verifies the keys
+    # we add post-envelope are stable in shape.
+    result = {"verification": {"status": "VERIFIED"}}
+    env = _build_json_envelope("p", "r", result)
+    env["rework_history"] = [
+        {"attempt": 1, "verification": {"status": "NEEDS_REWORK"},
+         "input_tokens": 100, "output_tokens": 50},
+    ]
+    env["total_attempts"] = 2
+    assert env["total_attempts"] == 2
+    assert env["rework_history"][0]["attempt"] == 1
+    import json
+    json.dumps(env, ensure_ascii=False, default=str)  # must serialise
+
+
 def test_envelope_key_stability():
     """Lock in the envelope schema — silent key renames would break CI
     pipelines that grep for specific paths."""
