@@ -104,6 +104,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                cli_only=True),
     CommandDef("audit", "Inspect the structured audit log of hook/verifier/plan events",
                "Info", args_hint="[tail [N]|summary|path]", cli_only=True),
+    CommandDef("lessons", "Browse lessons learned from past verifier rework cycles",
+               "Info", args_hint="[<query>|show <name>|count]", cli_only=True),
     CommandDef("snapshot", "Create or restore state snapshots of Hermes config/state", "Session",
                cli_only=True, aliases=("snap",), args_hint="[create|restore <id>|prune]"),
     CommandDef("stop", "Kill all running background processes", "Session"),

@@ -1969,6 +1969,9 @@ class AIAgent:
 
         # Fired exactly once per agent on the first run_conversation call.
         self._session_start_fired = False
+        # Lessons-learned preamble is injected on the first user message
+        # only — subsequent turns get fresh context naturally.
+        self._lessons_preamble_injected = False
         
         # SQLite session store (optional -- provided by CLI or gateway)
         self._session_db = session_db
@@ -12299,6 +12302,34 @@ class AIAgent:
             if self._turns_since_memory >= self._memory_nudge_interval:
                 _should_review_memory = True
                 self._turns_since_memory = 0
+
+        # Lessons-learned injection — on the FIRST user message of a
+        # session, look up lessons relevant to the prompt and prepend
+        # them as a system-prompt-style preamble inside the user
+        # message.  Cheap fuzzy retrieval (no embeddings); the lesson
+        # corpus is hand-curated from past rework cycles.  Skipped on
+        # subsequent turns to keep cost predictable.
+        if not getattr(self, "_lessons_preamble_injected", False):
+            self._lessons_preamble_injected = True
+            try:
+                from agent.lessons import (
+                    format_lessons_preamble, relevant_lessons,
+                )
+                lessons_hit = relevant_lessons(user_message, limit=3)
+                if lessons_hit:
+                    preamble = format_lessons_preamble(lessons_hit)
+                    if preamble:
+                        user_message = (
+                            f"<lessons-learned>\n{preamble}\n</lessons-learned>\n\n"
+                            f"{user_message}"
+                        )
+                        logger.info(
+                            "injected %d lesson(s) from prior sessions "
+                            "into the user prompt",
+                            len(lessons_hit),
+                        )
+            except Exception as exc:
+                logger.debug("lessons injection failed: %s", exc)
 
         # User-defined UserPromptSubmit hook — fires before the message
         # hits the transcript or the model.  Exit 2 (block) returns

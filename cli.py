@@ -2546,6 +2546,12 @@ class HermesCLI:
         
         # Conversation state
         self.conversation_history: List[Dict[str, Any]] = []
+        # Verifier auto-rework state (see _handle_response post-processing).
+        self._verification_rework_count = 0
+        # Buffered task/response/complaint captured on the first rework
+        # of a task, used to write a lesson if the rework loop converges
+        # on VERIFIED.  Cleared on VERIFIED or on max_attempts hit.
+        self._lessons_capture_buffer = None
         self.session_start = datetime.now()
         self._resumed = False
         # Per-prompt elapsed timer — started at the beginning of each chat turn,
@@ -5008,6 +5014,71 @@ class HermesCLI:
                                             getattr(self.agent._plan_mode, "plan_path", None)))
         except Exception as exc:
             print(f"  Verification failed: {exc}")
+
+    def _handle_lessons_command(self, command: str) -> None:
+        """Browse lessons learned from past verifier rework cycles.
+
+        Syntax:
+            /lessons               — show 5 most recent lessons
+            /lessons <query>       — search by relevance to query
+            /lessons count         — show total lesson count + dir path
+            /lessons show <name>   — show one lesson's full body
+        """
+        from agent import lessons as _lessons
+        parts = command.split(None, 2)
+        sub = (parts[1].strip().lower() if len(parts) > 1 else "")
+
+        if sub == "count":
+            all_l = _lessons.all_lessons()
+            print(f"  📚 {len(all_l)} lesson(s) in {_lessons._lessons_dir()}")
+            return
+
+        if sub == "show":
+            name = parts[2].strip() if len(parts) > 2 else ""
+            if not name:
+                print("  Usage: /lessons show <filename-stem>")
+                return
+            target_dir = _lessons._lessons_dir()
+            match = None
+            for path in target_dir.glob("*.md"):
+                if name in path.stem:
+                    match = path
+                    break
+            if match is None:
+                print(f"  No lesson matching {name!r}.")
+                return
+            print(f"  📁 {match}")
+            print()
+            print(match.read_text(encoding="utf-8"))
+            return
+
+        if sub:
+            # Treat the rest as a search query.
+            query = command.split(None, 1)[1].strip()
+            results = _lessons.relevant_lessons(query, limit=10)
+            if not results:
+                print(f"  No lessons matching {query!r}.")
+                return
+            print(f"  📚 {len(results)} relevant lesson(s) for {query!r}:")
+            for lesson in results:
+                tags = ",".join(lesson.tags[:4])
+                print(f"    {lesson.task[:60]:<60}  [{tags}]")
+            return
+
+        # Default: 5 most recent.
+        all_l = _lessons.all_lessons()
+        if not all_l:
+            print(f"  📚 No lessons yet — corpus lives in {_lessons._lessons_dir()}.")
+            print("  Lessons are captured automatically when the verifier")
+            print("  surfaces NEEDS_REWORK and a later attempt succeeds.")
+            return
+        recent = sorted(all_l, key=lambda l: -l.created_at)[:5]
+        print(f"  📚 {len(all_l)} lesson(s) total — showing 5 most recent:")
+        for lesson in recent:
+            import time as _t
+            ts = _t.strftime("%Y-%m-%d", _t.localtime(lesson.created_at))
+            tags = ",".join(lesson.tags[:4])
+            print(f"    {ts}  {lesson.task[:60]:<60}  [{tags}]")
 
     def _handle_audit_command(self, command: str) -> None:
         """Inspect the structured audit log of lifecycle events.
@@ -7995,6 +8066,8 @@ class HermesCLI:
             self._handle_subagents_command(cmd_original)
         elif canonical == "audit":
             self._handle_audit_command(cmd_original)
+        elif canonical == "lessons":
+            self._handle_lessons_command(cmd_original)
         elif canonical == "snapshot":
             self._handle_snapshot_command(cmd_original)
         elif canonical == "stop":
@@ -11084,6 +11157,15 @@ class HermesCLI:
                 _rework_count = getattr(self, "_verification_rework_count", 0)
                 if _rework_count < max_attempts:
                     self._verification_rework_count = _rework_count + 1
+                    # On the FIRST rework, remember enough to capture
+                    # a lesson if the agent later achieves VERIFIED.
+                    if _rework_count == 0:
+                        self._lessons_capture_buffer = {
+                            "task": message[:200] if isinstance(message, str) else "",
+                            "initial_response": (response or "")[:1500],
+                            "rework_summary": ((result.get("verification") or {})
+                                               .get("summary") or "")[:500],
+                        }
                     print(f"  🔁 Verifier requested rework "
                           f"(attempt {self._verification_rework_count}/{max_attempts})")
                     try:
@@ -11109,8 +11191,27 @@ class HermesCLI:
                           f"original response.")
                     self._verification_rework_count = 0
             elif isinstance(result, dict) and result.get("verification"):
-                # VERIFIED — reset the counter for the next task.
+                # VERIFIED — reset the counter for the next task.  If
+                # the task went through at least one rework cycle to get
+                # here, capture the delta as a lesson the agent can use
+                # next time.  Best-effort: never propagate failures.
+                if (result.get("verification", {}) or {}).get("status") == "VERIFIED":
+                    prior_count = self._verification_rework_count
+                    if prior_count > 0 and self._lessons_capture_buffer:
+                        try:
+                            from agent import lessons as _lessons
+                            buf = self._lessons_capture_buffer
+                            _lessons.capture_from_rework(
+                                task=buf.get("task", message[:120]),
+                                initial_response=buf.get("initial_response", ""),
+                                needs_rework_summary=buf.get("rework_summary", ""),
+                                final_response=response,
+                                session_id=str(getattr(self.agent, "session_id", "") or ""),
+                            )
+                        except Exception as exc:
+                            logger.debug("could not capture lesson: %s", exc)
                 self._verification_rework_count = 0
+                self._lessons_capture_buffer = None
 
             # Auto-generate session title after first exchange (non-blocking)
             if response and result and not result.get("failed") and not result.get("partial"):
