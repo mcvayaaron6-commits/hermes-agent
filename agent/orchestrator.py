@@ -42,7 +42,7 @@ import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Dict, Iterable, List, Optional, Set
+from typing import Any, Callable, Dict, Iterable, List, Optional, Protocol, Set
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +65,7 @@ class TaskState(Enum):
     SKIPPED = "skipped"  # upstream failed and policy = "skip_on_upstream_fail"
 
 
-@dataclass
+@dataclass(slots=True)
 class TaskSpec:
     """One node in the DAG."""
 
@@ -81,7 +81,7 @@ class TaskSpec:
     requires_upstream_success: bool = True
 
 
-@dataclass
+@dataclass(slots=True)
 class TaskResult:
     """The outcome of one task node."""
 
@@ -162,6 +162,29 @@ def validate_dag(tasks: Iterable[TaskSpec]) -> List[str]:
 
 #: Type for the task-executor function — abstracted so tests can inject
 #: a fake.  Real one calls into ``tools.delegate_tool.delegate_task``.
+#:
+#: Defined as a Protocol AND a callable alias so callers can either:
+#:   * write a plain function with the right signature (most common), OR
+#:   * implement ``TaskExecutorProtocol`` on a class with state
+#:     (e.g. a remote-fleet executor with a connection pool).
+class TaskExecutorProtocol(Protocol):
+    """Structural type for task executors.
+
+    Implementations receive the task spec and a snapshot of completed
+    upstream results, and must return a ``TaskResult``.  Raising is
+    legal — the orchestrator catches and marks the task FAILED with
+    the exception text — but returning a real TaskResult lets the
+    executor carry extra metadata (iterations_used, agent_id, etc.)
+    that the aggregate uses.
+    """
+
+    def __call__(
+        self,
+        spec: TaskSpec,
+        prior_results: Dict[str, TaskResult],
+    ) -> TaskResult: ...
+
+
 TaskExecutor = Callable[[TaskSpec, Dict[str, TaskResult]], TaskResult]
 
 

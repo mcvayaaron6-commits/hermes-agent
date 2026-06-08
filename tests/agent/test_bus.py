@@ -240,3 +240,72 @@ def test_get_bus_returns_singleton():
     b = get_bus()
     assert a is b
     reset_default_bus()
+
+
+# ---------------------------------------------------------------------------
+# Bus → audit log integration
+# ---------------------------------------------------------------------------
+
+
+def test_publish_writes_to_audit_log_when_enabled(tmp_path, monkeypatch):
+    """Bus events flow into the tamper-evident audit chain when
+    audit.enabled is true.  This is the single tamper-evident trace
+    operators rely on for compliance."""
+    from agent import audit_log as al
+    audit_path = tmp_path / "audit.jsonl"
+    monkeypatch.setattr(al, "_audit_config",
+                        lambda: {"enabled": True, "path": str(audit_path)})
+    al._reset_chain_state()
+    b = Bus()
+    try:
+        b.publish(ToolStartedEvent(
+            subject="agent.42.tool_started",
+            agent_id="42", tool_name="write_file",
+        ), sync=True)
+    finally:
+        b.close()
+    # Audit file got the event.
+    assert audit_path.exists()
+    import json as _json
+    lines = audit_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1
+    entry = _json.loads(lines[0])
+    assert entry["event"] == "ToolStartedEvent"
+    assert entry["data"]["agent_id"] == "42"
+    assert entry["data"]["tool_name"] == "write_file"
+
+
+def test_publish_silent_when_audit_disabled(tmp_path, monkeypatch):
+    from agent import audit_log as al
+    audit_path = tmp_path / "audit.jsonl"
+    monkeypatch.setattr(al, "_audit_config",
+                        lambda: {"enabled": False, "path": str(audit_path)})
+    al._reset_chain_state()
+    b = Bus()
+    try:
+        b.publish(ToolStartedEvent(
+            subject="x", agent_id="1", tool_name="x",
+        ), sync=True)
+    finally:
+        b.close()
+    # No audit file written.
+    assert not audit_path.exists()
+
+
+def test_audit_write_failure_does_not_block_dispatch(tmp_path, monkeypatch):
+    """A broken audit log can't stop the bus from delivering to subscribers."""
+    from agent import audit_log as al
+    # Point audit to a path that will fail to write (parent file blocks dir creation).
+    bad = tmp_path / "not-a-dir"
+    bad.touch()  # exists as file, can't be a dir
+    monkeypatch.setattr(al, "_audit_config",
+                        lambda: {"enabled": True, "path": str(bad / "audit.jsonl")})
+    al._reset_chain_state()
+    received = []
+    b = Bus()
+    try:
+        b.subscribe(received.append, subject="topic.x")
+        b.publish(BusEvent(subject="topic.x"), sync=True)
+    finally:
+        b.close()
+    assert len(received) == 1

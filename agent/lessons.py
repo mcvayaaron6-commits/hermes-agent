@@ -450,6 +450,18 @@ def capture_from_rework(
     except OSError as exc:
         logger.warning("could not save lesson to disk: %s", exc)
         return None
+    # Publish on the bus so subscribers (sibling agents, audit log,
+    # topology UI) see the lesson land.  Best-effort: failures here
+    # never propagate.
+    try:
+        from agent.bus import publish_lesson_captured
+        publish_lesson_captured(
+            lesson_path=str(lesson.source_path) if lesson.source_path else "",
+            task=lesson.task,
+            tags=lesson.tags,
+        )
+    except Exception as exc:
+        logger.debug("could not publish LessonCapturedEvent: %s", exc)
     return lesson
 
 

@@ -234,11 +234,14 @@ def run_orchestrate(
               f"{agg.total_duration_seconds:.1f}s  "
               f"(fanout={fanout})")
         for tid, r in agg.results.items():
-            glyph = {
-                TaskState.SUCCEEDED: "✓",
-                TaskState.FAILED:    "✗",
-                TaskState.SKIPPED:   "↳",
-            }.get(r.state, "?")
+            # Structural pattern matching — Python 3.10+ idiom for
+            # enum→display dispatch.  More readable than dict.get(default)
+            # when the cases meaningfully differ.
+            match r.state:
+                case TaskState.SUCCEEDED: glyph = "✓"
+                case TaskState.FAILED:    glyph = "✗"
+                case TaskState.SKIPPED:   glyph = "↳"
+                case _:                   glyph = "?"
             err = f"  — {r.error}" if r.error else ""
             print(f"  {glyph} {tid:<24}  {r.state.value:<10}  "
                   f"{r.duration_seconds:5.1f}s{err}")

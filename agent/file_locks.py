@@ -65,7 +65,7 @@ class LockOutcome(Enum):
     EXPIRED = "expired"    # prior holder's TTL elapsed; we took over
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class LockRecord:
     path: str
     owner: str

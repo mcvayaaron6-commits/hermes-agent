@@ -241,11 +241,34 @@ class Bus:
 
         ``sync=True`` runs handlers inline on the publisher's thread —
         useful in tests and when ordering matters across publish calls.
+
+        Also writes the event to the structured audit log (when
+        ``audit.enabled`` is set in config).  This gives operators a
+        single tamper-evident JSONL trace of every bus event without
+        every publisher having to remember to ``audit_log.write_event``.
+        Audit writes are best-effort: a failure here never blocks the
+        bus dispatch.
         """
         if self._closed:
             return
         if not isinstance(event, BusEvent):
             raise TypeError(f"publish requires BusEvent, got {type(event).__name__}")
+        # Stamp the event into the audit chain.  Lazy import keeps the
+        # bus module dependency-free for tests that don't want the
+        # audit log triggered.
+        try:
+            from agent import audit_log as _al
+            if _al._is_enabled():
+                # Re-use the event's own type name so audit grepping
+                # matches bus subjects naturally.
+                _al.write_event(
+                    type(event).__name__,
+                    session_id="",
+                    data={k: v for k, v in event.to_dict().items()
+                          if k not in {"subject", "ts", "event_id"}},
+                )
+        except Exception:
+            pass
         with self._lock:
             self._history[event.subject].append(event)
             handlers: List[Callable] = []
