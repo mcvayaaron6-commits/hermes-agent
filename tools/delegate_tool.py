@@ -1918,9 +1918,23 @@ def _get_subagent_profile_registry(parent_agent):
         allow_project = bool(cfg.get("allow_project_profiles", True))
     except Exception:
         allow_project = True
+
+    # Bundled starter profiles (Explore, code-reviewer, test-writer)
+    # live next to the Hermes source so users get a useful registry
+    # out of the box without copy-pasting from the docs.  User-level
+    # profiles in ~/.hermes/agents/ override these (higher precedence
+    # source rank); project-level profiles in .hermes/agents/ override
+    # both unless allow_project_profiles is false.
+    from pathlib import Path as _P
+    bundled_dir = _P(__file__).resolve().parent.parent / "agents_bundled"
+    builtin_dirs = [bundled_dir] if bundled_dir.is_dir() else []
+
     try:
         from agent.subagent_profiles import discover_profiles
-        registry = discover_profiles(allow_project_profiles=allow_project)
+        registry = discover_profiles(
+            builtin_dirs=builtin_dirs,
+            allow_project_profiles=allow_project,
+        )
     except Exception as exc:
         logger.debug("subagent profile discovery failed: %s", exc)
         from agent.subagent_profiles import SubagentProfileRegistry
