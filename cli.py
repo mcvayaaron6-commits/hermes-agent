@@ -4987,6 +4987,78 @@ class HermesCLI:
         except Exception as exc:
             print(f"  Verification failed: {exc}")
 
+    def _handle_subagents_command(self, command: str) -> None:
+        """List, reload, or inspect named subagent profiles.
+
+        Syntax:
+            /subagents              — list all available profiles
+            /subagents reload       — force re-read of profile files from disk
+            /subagents show <name>  — show one profile's full body
+        """
+        if not hasattr(self, "agent") or not self.agent:
+            print("  No active agent session.")
+            return
+        parts = command.split(None, 2)
+        sub = (parts[1].strip().lower() if len(parts) > 1 else "")
+
+        if sub == "reload":
+            try:
+                self.agent._subagent_profile_registry = None
+                from tools.delegate_tool import _get_subagent_profile_registry
+                registry = _get_subagent_profile_registry(self.agent)
+                print(f"  ↻ Reloaded — {len(registry)} subagent profile(s) active.")
+            except Exception as exc:
+                print(f"  Reload failed: {exc}")
+            return
+
+        try:
+            from tools.delegate_tool import _get_subagent_profile_registry
+            registry = _get_subagent_profile_registry(self.agent)
+        except Exception as exc:
+            print(f"  Could not load profile registry: {exc}")
+            return
+
+        if sub == "show":
+            name = parts[2].strip() if len(parts) > 2 else ""
+            if not name:
+                print("  Usage: /subagents show <name>")
+                return
+            profile = registry.get(name)
+            if profile is None:
+                available = ", ".join(registry.names()) or "(none)"
+                print(f"  No profile named {name!r}. Available: {available}")
+                return
+            print(f"  📁 {profile.source_path or '<inline>'}  [{profile.source}]")
+            print(f"  name: {profile.name}")
+            if profile.description:
+                print(f"  description: {profile.description}")
+            if profile.toolsets:
+                print(f"  toolsets: {', '.join(profile.toolsets)}")
+            if profile.model:
+                print(f"  model: {profile.model}")
+            if profile.max_iterations:
+                print(f"  max_iterations: {profile.max_iterations}")
+            print()
+            print(profile.system_prompt)
+            return
+
+        # Default: list.
+        if len(registry) == 0:
+            print("  No subagent profiles loaded.")
+            print("  Drop ~/.hermes/agents/<name>.md or .hermes/agents/<name>.md "
+                  "in your repo.")
+            print("  Example body: ./website/docs/user-guide/features/subagents.md")
+            return
+        print(f"  {len(registry)} subagent profile(s) loaded:")
+        for entry in registry.describe():
+            src = entry["source"]
+            tools = ",".join(entry["toolsets"]) if entry["toolsets"] else "all"
+            model = entry["model"] or "inherit"
+            desc = entry["description"] or "(no description)"
+            print(f"    {entry['name']:<24}  [{src}]  tools={tools:<20}  "
+                  f"model={model}")
+            print(f"      {desc[:120]}")
+
     def _handle_snapshot_command(self, command: str):
         """Handle /snapshot — lightweight state snapshots for Hermes config/state.
 
@@ -7837,6 +7909,8 @@ class HermesCLI:
             self._handle_hooks_command(cmd_original)
         elif canonical == "verify":
             self._handle_verify_command()
+        elif canonical == "subagents":
+            self._handle_subagents_command(cmd_original)
         elif canonical == "snapshot":
             self._handle_snapshot_command(cmd_original)
         elif canonical == "stop":

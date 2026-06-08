@@ -10765,6 +10765,7 @@ class AIAgent:
             acp_command=function_args.get("acp_command"),
             acp_args=function_args.get("acp_args"),
             role=function_args.get("role"),
+            subagent_type=function_args.get("subagent_type"),
             parent_agent=self,
         )
         try:
