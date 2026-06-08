@@ -786,6 +786,23 @@ DEFAULT_CONFIG = {
         "provider": None,
         "model": None,
         "max_tokens": 2000,
+        # Differential verification — when enabled, _run_verifier
+        # spawns one verifier per model in `consensus.models` in
+        # parallel and aggregates via quorum voting.  Safety-first
+        # tiebreaker: NEEDS_REWORK wins over VERIFIED when both
+        # reach quorum.  Trades ~3x verifier tokens for much higher
+        # trust on high-stakes tasks.
+        "consensus": {
+            "enabled": False,
+            # List of model identifiers (Hermes resolves provider
+            # via the usual rules).  Example:
+            #   ["anthropic/claude-sonnet-4-6", "openai/gpt-5",
+            #    "anthropic/claude-haiku-4-5"]
+            "models": [],
+            # How many voters must agree for that status to win.
+            # Typical: 2 (of 3 models).  Higher = stricter.
+            "quorum_required": 2,
+        },
     },
 
     # Maximum characters returned by a single read_file call.  Reads that

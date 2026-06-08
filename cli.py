@@ -2552,6 +2552,10 @@ class HermesCLI:
         # of a task, used to write a lesson if the rework loop converges
         # on VERIFIED.  Cleared on VERIFIED or on max_attempts hit.
         self._lessons_capture_buffer = None
+        # Track how many promotion candidates were visible last time
+        # we checked, so the post-lesson nudge fires once per new
+        # pattern rather than every rework cycle.
+        self._last_promotion_candidate_count = 0
         self.session_start = datetime.now()
         self._resumed = False
         # Per-prompt elapsed timer — started at the beginning of each chat turn,
@@ -5014,6 +5018,36 @@ class HermesCLI:
                                             getattr(self.agent._plan_mode, "plan_path", None)))
         except Exception as exc:
             print(f"  Verification failed: {exc}")
+
+    def _maybe_surface_promotion_nudge(self) -> None:
+        """Check the promotion engine; if there's a new candidate, nudge.
+
+        Called after a fresh lesson lands (rework→VERIFIED).  Stays
+        silent unless a NEW pattern crosses the threshold this turn —
+        we track the last-seen candidate count on the CLI instance so
+        the nudge fires exactly once per emerging pattern.
+        """
+        try:
+            from agent import skill_promotion as _sp
+            candidates = _sp.find_skill_candidates()
+            candidates = _sp.filter_already_installed(candidates)
+            n = len(candidates)
+            prior = getattr(self, "_last_promotion_candidate_count", 0)
+            if n > prior:
+                # New pattern emerged this turn — nudge once.
+                self._last_promotion_candidate_count = n
+                # Show only the newly-strongest one to avoid noise.
+                top = candidates[0] if candidates else None
+                if top is not None:
+                    print(f"  🌱 New skill candidate ready: `{top.name}` "
+                          f"(score={top.score:.1f}, "
+                          f"tags={','.join(top.shared_tags[:3])})")
+                    print(f"  Run /promotions to review, "
+                          f"/promotions install {top.name} to adopt.")
+            else:
+                self._last_promotion_candidate_count = n
+        except Exception as exc:
+            logger.debug("promotion nudge failed: %s", exc)
 
     def _handle_promotions_command(self, command: str) -> None:
         """Review auto-promotion candidates from clustered lessons.
@@ -11297,6 +11331,12 @@ class HermesCLI:
                                 final_response=response,
                                 session_id=str(getattr(self.agent, "session_id", "") or ""),
                             )
+                            # Moat 10x: after a fresh lesson lands, check
+                            # whether the corpus has accumulated enough
+                            # clustered evidence to propose a new skill.
+                            # We don't install — we surface as a one-line
+                            # nudge.  User runs /promotions to confirm.
+                            self._maybe_surface_promotion_nudge()
                         except Exception as exc:
                             logger.debug("could not capture lesson: %s", exc)
                 self._verification_rework_count = 0

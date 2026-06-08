@@ -33,7 +33,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Set
 
 logger = logging.getLogger(__name__)
 
@@ -381,7 +381,133 @@ def render_summary_for_user(report: VerificationReport) -> str:
     return f"verification error: {report.summary or report.parse_error or 'unknown'}"
 
 
+# ---------------------------------------------------------------------------
+# Differential verification — multi-model consensus
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ConsensusReport:
+    """The outcome of running N verifiers in parallel and voting.
+
+    The aggregated ``status`` is decided by quorum: ``quorum_required``
+    out of ``len(reports)`` must agree.  When no status reaches quorum,
+    the result is ERROR (caller decides — usually escalate to a human).
+    """
+
+    status: str
+    quorum_required: int
+    reports: List["VerificationReport"] = field(default_factory=list)
+    summary: str = ""
+    issues: List["VerificationIssue"] = field(default_factory=list)
+    voted_status_counts: Dict[str, int] = field(default_factory=dict)
+    models_used: List[str] = field(default_factory=list)
+
+    @property
+    def verified(self) -> bool:
+        return self.status == STATUS_VERIFIED
+
+    @property
+    def needs_rework(self) -> bool:
+        return self.status == STATUS_NEEDS_REWORK
+
+    @property
+    def is_error(self) -> bool:
+        return self.status == STATUS_ERROR
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "status": self.status,
+            "quorum_required": self.quorum_required,
+            "voted_status_counts": dict(self.voted_status_counts),
+            "models_used": list(self.models_used),
+            "summary": self.summary,
+            "issues": [
+                {
+                    "description": i.description,
+                    "suggested_fix": i.suggested_fix,
+                    "step": i.step,
+                    "severity": i.severity,
+                }
+                for i in self.issues
+            ],
+            "per_verifier": [r.to_dict() for r in self.reports],
+        }
+
+
+def aggregate_consensus(
+    reports: List[VerificationReport],
+    *,
+    quorum_required: int = 2,
+    models_used: Optional[List[str]] = None,
+) -> ConsensusReport:
+    """Vote across N verifier reports.  Quorum-based consensus.
+
+    Rules:
+    * If ``quorum_required`` reports share the same status, that
+      status wins.  Cosmic tiebreaker order is NEEDS_REWORK >
+      VERIFIED > ERROR (safety first — when in doubt, rework).
+    * Issues are unioned across all NEEDS_REWORK voters and
+      deduplicated by (description prefix).  Severity is the max
+      severity across duplicates.
+    * Summary aggregates the most-cited concerns.
+
+    Raises ValueError if ``reports`` is empty.
+    """
+    if not reports:
+        raise ValueError("aggregate_consensus requires at least one report")
+    if quorum_required < 1:
+        quorum_required = 1
+    if quorum_required > len(reports):
+        # Can't reach quorum that's larger than the population — clamp.
+        quorum_required = len(reports)
+
+    # Count votes by status.
+    counts: Dict[str, int] = {}
+    for r in reports:
+        counts[r.status] = counts.get(r.status, 0) + 1
+
+    # Find a status that meets quorum.  Apply the safety-first
+    # tiebreaker order: NEEDS_REWORK > VERIFIED > ERROR.
+    consensus_status: Optional[str] = None
+    for candidate in (STATUS_NEEDS_REWORK, STATUS_VERIFIED, STATUS_ERROR):
+        if counts.get(candidate, 0) >= quorum_required:
+            consensus_status = candidate
+            break
+
+    if consensus_status is None:
+        # No quorum — surface as ERROR so the caller can decide.
+        consensus_status = STATUS_ERROR
+
+    # Aggregate summary + issues from voters whose status matches.
+    matching = [r for r in reports if r.status == consensus_status]
+    summaries = [r.summary for r in matching if r.summary]
+    summary = " | ".join(summaries[:3])
+
+    # Union of issues, deduped by description prefix (40 chars).
+    seen_prefixes: Set[str] = set()
+    merged_issues: List[VerificationIssue] = []
+    for r in matching:
+        for issue in r.issues:
+            key = issue.description[:40].lower()
+            if key in seen_prefixes:
+                continue
+            seen_prefixes.add(key)
+            merged_issues.append(issue)
+
+    return ConsensusReport(
+        status=consensus_status,
+        quorum_required=quorum_required,
+        reports=list(reports),
+        summary=summary,
+        issues=merged_issues,
+        voted_status_counts=counts,
+        models_used=list(models_used or []),
+    )
+
+
 __all__ = [
+    "ConsensusReport",
     "DEFAULT_MAX_ATTEMPTS",
     "STATUS_ERROR",
     "STATUS_NEEDS_REWORK",
@@ -390,6 +516,7 @@ __all__ = [
     "VERIFIER_SYSTEM_PROMPT",
     "VerificationIssue",
     "VerificationReport",
+    "aggregate_consensus",
     "build_verifier_user_prompt",
     "parse_verification_response",
     "render_rework_message",

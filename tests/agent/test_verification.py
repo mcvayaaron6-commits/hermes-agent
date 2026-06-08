@@ -319,3 +319,137 @@ def test_default_max_attempts_positive():
 
 def test_status_constants_distinct():
     assert STATUS_VERIFIED != STATUS_NEEDS_REWORK != STATUS_ERROR
+
+
+# ---------------------------------------------------------------------------
+# Differential verification — quorum consensus
+# ---------------------------------------------------------------------------
+
+
+def test_consensus_three_verified_passes():
+    from agent.verification import aggregate_consensus
+    reports = [
+        VerificationReport(status=STATUS_VERIFIED, summary="ok"),
+        VerificationReport(status=STATUS_VERIFIED, summary="ok"),
+        VerificationReport(status=STATUS_VERIFIED, summary="ok"),
+    ]
+    result = aggregate_consensus(reports, quorum_required=2)
+    assert result.verified
+    assert result.voted_status_counts[STATUS_VERIFIED] == 3
+
+
+def test_consensus_two_of_three_quorum():
+    from agent.verification import aggregate_consensus
+    reports = [
+        VerificationReport(status=STATUS_VERIFIED, summary="looks fine"),
+        VerificationReport(status=STATUS_VERIFIED, summary="checks pass"),
+        VerificationReport(status=STATUS_NEEDS_REWORK, summary="missed edge case",
+                           issues=[VerificationIssue(description="edge case")]),
+    ]
+    result = aggregate_consensus(reports, quorum_required=2)
+    assert result.verified
+    assert result.voted_status_counts[STATUS_VERIFIED] == 2
+    assert result.voted_status_counts[STATUS_NEEDS_REWORK] == 1
+
+
+def test_consensus_safety_first_tiebreaker():
+    """When NEEDS_REWORK and VERIFIED both hit quorum, NEEDS_REWORK
+    wins — safety first."""
+    from agent.verification import aggregate_consensus
+    reports = [
+        VerificationReport(status=STATUS_NEEDS_REWORK, summary="x",
+                           issues=[VerificationIssue(description="issue1")]),
+        VerificationReport(status=STATUS_NEEDS_REWORK, summary="y",
+                           issues=[VerificationIssue(description="issue2")]),
+        VerificationReport(status=STATUS_VERIFIED, summary="actually fine"),
+        VerificationReport(status=STATUS_VERIFIED, summary="works for me"),
+    ]
+    result = aggregate_consensus(reports, quorum_required=2)
+    assert result.needs_rework  # safety wins
+
+
+def test_consensus_no_quorum_returns_error():
+    from agent.verification import aggregate_consensus
+    reports = [
+        VerificationReport(status=STATUS_VERIFIED),
+        VerificationReport(status=STATUS_NEEDS_REWORK),
+        VerificationReport(status=STATUS_ERROR),
+    ]
+    result = aggregate_consensus(reports, quorum_required=2)
+    # No status reaches quorum of 2
+    assert result.is_error
+
+
+def test_consensus_aggregates_issues_dedups():
+    """Issues whose first 40 chars match dedupe to one entry."""
+    from agent.verification import aggregate_consensus
+    # Two issues with IDENTICAL first 40 chars (different suffixes) —
+    # these dedupe to one.  Plus two distinct issues that don't.
+    long_a = "Missing redirect URI in OAuth callback handler --- staging variant"
+    long_b = "Missing redirect URI in OAuth callback handler --- production variant"
+    assert long_a[:40] == long_b[:40]  # sanity check the test data
+    reports = [
+        VerificationReport(
+            status=STATUS_NEEDS_REWORK,
+            issues=[
+                VerificationIssue(description=long_a),
+                VerificationIssue(description="off-by-one in loop"),
+            ],
+        ),
+        VerificationReport(
+            status=STATUS_NEEDS_REWORK,
+            issues=[
+                VerificationIssue(description=long_b),  # dedupes with long_a
+                VerificationIssue(description="race condition possible"),
+            ],
+        ),
+    ]
+    result = aggregate_consensus(reports, quorum_required=2)
+    assert result.needs_rework
+    descs = [i.description for i in result.issues]
+    # 3 unique: long_a (long_b deduped), off-by-one, race
+    assert len(descs) == 3
+
+
+def test_consensus_quorum_clamped_to_population():
+    from agent.verification import aggregate_consensus
+    reports = [
+        VerificationReport(status=STATUS_VERIFIED),
+        VerificationReport(status=STATUS_VERIFIED),
+    ]
+    # Asking for quorum_required=5 with only 2 reports — clamped to 2.
+    result = aggregate_consensus(reports, quorum_required=5)
+    assert result.verified
+    assert result.quorum_required == 2
+
+
+def test_consensus_empty_raises():
+    from agent.verification import aggregate_consensus
+    import pytest as _pytest
+    with _pytest.raises(ValueError):
+        aggregate_consensus([], quorum_required=1)
+
+
+def test_consensus_single_report_passes_through():
+    from agent.verification import aggregate_consensus
+    reports = [VerificationReport(status=STATUS_VERIFIED, summary="only voter")]
+    result = aggregate_consensus(reports, quorum_required=1)
+    assert result.verified
+    assert result.summary == "only voter"
+
+
+def test_consensus_to_dict_serialisable():
+    from agent.verification import aggregate_consensus
+    import json
+    reports = [
+        VerificationReport(status=STATUS_VERIFIED, summary="a"),
+        VerificationReport(status=STATUS_VERIFIED, summary="b"),
+    ]
+    result = aggregate_consensus(reports, quorum_required=2,
+                                  models_used=["sonnet-4", "haiku-4", "gpt-4"])
+    d = result.to_dict()
+    json.dumps(d)
+    assert d["models_used"] == ["sonnet-4", "haiku-4", "gpt-4"]
+    assert d["quorum_required"] == 2
+    assert "per_verifier" in d
+    assert len(d["per_verifier"]) == 2

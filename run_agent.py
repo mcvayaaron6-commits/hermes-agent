@@ -5819,12 +5819,19 @@ class AIAgent:
         is true (the default), verification runs even if the global
         ``verification.enabled`` is false — the operator already opted
         in by typing /plan, no need to flip a second switch.
+
+        Consensus sub-block: when ``verification.consensus.enabled``
+        is true, _run_verifier spawns N verifiers in parallel (one
+        per model in ``consensus.models``) and aggregates with
+        quorum-based voting.  Safety-first tiebreaker: NEEDS_REWORK
+        wins over VERIFIED when both reach quorum.
         """
         try:
             from hermes_cli.config import load_config
             cfg = (load_config().get("verification") or {})
         except Exception:
             cfg = {}
+        consensus_cfg = (cfg.get("consensus") or {}) if isinstance(cfg, dict) else {}
         return {
             "enabled": bool(cfg.get("enabled", False)),
             "auto_when_plan": bool(cfg.get("auto_when_plan", True)),
@@ -5832,6 +5839,13 @@ class AIAgent:
             "model": cfg.get("model"),
             "provider": cfg.get("provider"),
             "max_tokens": int(cfg.get("max_tokens", 2000)),
+            "consensus": {
+                "enabled": bool(consensus_cfg.get("enabled", False)),
+                "models": list(consensus_cfg.get("models") or []),
+                "quorum_required": max(
+                    1, int(consensus_cfg.get("quorum_required", 2)),
+                ),
+            },
         }
 
     def _capture_git_diff(self) -> Optional[str]:
@@ -5934,6 +5948,49 @@ class AIAgent:
             {"role": "system", "content": VERIFIER_SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ]
+        # Consensus mode — run multiple verifiers in parallel and vote.
+        consensus_cfg = cfg.get("consensus") or {}
+        if consensus_cfg.get("enabled") and consensus_cfg.get("models"):
+            from concurrent.futures import ThreadPoolExecutor
+            from agent.verification import aggregate_consensus
+            models = list(consensus_cfg["models"])
+            quorum = consensus_cfg["quorum_required"]
+            reports_list: list = []
+
+            def _verify_one(model_name: str) -> VerificationReport:
+                try:
+                    text = self._call_verifier_llm(
+                        messages,
+                        model=model_name,
+                        provider=cfg["provider"],
+                        max_tokens=cfg["max_tokens"],
+                    )
+                    return parse_verification_response(text)
+                except Exception as exc:
+                    return VerificationReport(
+                        status=STATUS_ERROR,
+                        summary=f"verifier ({model_name}) failed: {exc}",
+                    )
+
+            with ThreadPoolExecutor(max_workers=len(models)) as pool:
+                futures = [pool.submit(_verify_one, m) for m in models]
+                for f in futures:
+                    reports_list.append(f.result())
+            consensus = aggregate_consensus(
+                reports_list, quorum_required=quorum, models_used=models,
+            )
+            # Collapse the consensus into a flat VerificationReport so
+            # downstream callers (rework loop, audit) keep the same API.
+            flat = VerificationReport(
+                status=consensus.status,
+                summary=(consensus.summary
+                         or f"consensus={consensus.voted_status_counts}"),
+                issues=list(consensus.issues),
+            )
+            _audit_verification_event(self, flat)
+            return flat
+
+        # Single-verifier path (default).
         try:
             response_text = self._call_verifier_llm(
                 messages,
