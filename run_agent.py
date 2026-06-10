@@ -382,6 +382,29 @@ _DESTRUCTIVE_PATTERNS = re.compile(
 _REDIRECT_OVERWRITE = re.compile(r'[^>]>[^>]|^>[^>]')
 
 
+def _audit_verification_event(agent, report) -> None:
+    """Write a Verification event to the audit log.  Best-effort.
+
+    Module-level (not a method) so unit tests can call _run_verifier
+    against a stub agent without binding every helper.  No-ops if the
+    audit log import or write fails.
+    """
+    try:
+        from agent import audit_log
+        audit_log.write_event(
+            audit_log.EVENT_VERIFICATION,
+            session_id=str(getattr(agent, "session_id", "") or ""),
+            data={
+                "status": report.status,
+                "summary": report.summary[:512],
+                "issue_count": len(report.issues),
+                "attempts": report.attempts,
+            },
+        )
+    except Exception:
+        pass
+
+
 def _is_destructive_command(cmd: str) -> bool:
     """Heuristic: does this terminal command look like it modifies/deletes files?"""
     if not cmd:
@@ -1928,6 +1951,27 @@ class AIAgent:
             max_total_size_mb=checkpoint_max_total_size_mb,
             max_file_size_mb=checkpoint_max_file_size_mb,
         )
+
+        # User-defined hook registry — lazy-loaded on first hook fire so a
+        # malformed hooks.json in some other repo can't break agent init.
+        self._hook_registry = None
+        self._hook_registry_loaded = False
+        self._hook_load_report = None
+
+        # Plan Mode state — off by default.  Toggled by the /plan and
+        # /exit-plan slash commands.  When enabled, _invoke_tool refuses
+        # any tool not on the read-only allowlist.
+        try:
+            from agent.plan_mode import PlanModeState
+            self._plan_mode = PlanModeState()
+        except Exception:
+            self._plan_mode = None
+
+        # Fired exactly once per agent on the first run_conversation call.
+        self._session_start_fired = False
+        # Lessons-learned preamble is injected on the first user message
+        # only — subsequent turns get fresh context naturally.
+        self._lessons_preamble_injected = False
         
         # SQLite session store (optional -- provided by CLI or gateway)
         self._session_db = session_db
@@ -5760,6 +5804,343 @@ class AIAgent:
                 self.client = None
         except Exception:
             pass
+
+        # 6. Fire SessionEnd hook (best-effort, never blocks shutdown)
+        try:
+            self._fire_hook("SessionEnd")
+        except Exception:
+            pass
+
+    def _verification_config(self) -> dict:
+        """Read the verification.* config block with sane defaults.
+
+        Defaults: disabled unless the user opts in.  When a Plan Mode
+        artifact exists for this session and ``verification.auto_when_plan``
+        is true (the default), verification runs even if the global
+        ``verification.enabled`` is false — the operator already opted
+        in by typing /plan, no need to flip a second switch.
+
+        Consensus sub-block: when ``verification.consensus.enabled``
+        is true, _run_verifier spawns N verifiers in parallel (one
+        per model in ``consensus.models``) and aggregates with
+        quorum-based voting.  Safety-first tiebreaker: NEEDS_REWORK
+        wins over VERIFIED when both reach quorum.
+        """
+        try:
+            from hermes_cli.config import load_config
+            cfg = (load_config().get("verification") or {})
+        except Exception:
+            cfg = {}
+        consensus_cfg = (cfg.get("consensus") or {}) if isinstance(cfg, dict) else {}
+        return {
+            "enabled": bool(cfg.get("enabled", False)),
+            "auto_when_plan": bool(cfg.get("auto_when_plan", True)),
+            "max_attempts": max(1, int(cfg.get("max_attempts", 2))),
+            "model": cfg.get("model"),
+            "provider": cfg.get("provider"),
+            "max_tokens": int(cfg.get("max_tokens", 2000)),
+            "consensus": {
+                "enabled": bool(consensus_cfg.get("enabled", False)),
+                "models": list(consensus_cfg.get("models") or []),
+                "quorum_required": max(
+                    1, int(consensus_cfg.get("quorum_required", 2)),
+                ),
+            },
+        }
+
+    def _capture_git_diff(self) -> Optional[str]:
+        """Best-effort: git diff between origin/HEAD (or HEAD~ for solo dev)
+        and the current working tree, for the verifier to inspect.
+
+        Returns None when not in a git repo or git fails.  Never raises —
+        verification must work in non-git contexts (the verifier still has
+        the plan + final response to judge on).
+        """
+        import subprocess as _subproc
+        for ref in ("HEAD", "HEAD~1"):
+            try:
+                result = _subproc.run(
+                    ["git", "diff", "--no-color", ref],
+                    capture_output=True, text=True, timeout=10,
+                    cwd=os.getcwd(),
+                )
+                if result.returncode == 0:
+                    out = (result.stdout or "").strip()
+                    if out:
+                        return out[:64 * 1024]
+                    return ""
+            except (_subproc.TimeoutExpired, FileNotFoundError, OSError):
+                continue
+        return None
+
+    def _call_verifier_llm(self, messages: list, *, model: Optional[str],
+                           provider: Optional[str], max_tokens: int) -> str:
+        """Mockable seam for the verifier model call.  Returns raw text.
+
+        Threads the agent's main_runtime (base_url, api_key, api_mode,
+        provider, model) through to call_llm so the verifier inherits
+        the same endpoint and credentials as the executor — without
+        this, an agent on a custom base_url / OAuth provider would
+        have the verifier auto-resolve a *different* endpoint from
+        config/env, or fail outright when creds were passed at
+        construction rather than living in config.
+        """
+        from agent.auxiliary_client import call_llm
+        # Inherit the agent's runtime by default; only the explicit
+        # provider/model overrides from verification.* config win.
+        try:
+            runtime = self._current_main_runtime()
+        except Exception:
+            runtime = None
+        response = call_llm(
+            provider=provider,
+            model=model or self.model,
+            messages=messages,
+            temperature=0.0,
+            max_tokens=max_tokens,
+            main_runtime=runtime,
+        )
+        try:
+            return (response.choices[0].message.content or "").strip()
+        except (AttributeError, IndexError, KeyError):
+            return ""
+
+    def _run_verifier(self, *, final_response: str,
+                      plan_path: Optional[str] = None,
+                      test_output: Optional[str] = None) -> Optional[Any]:
+        """Spawn the verifier and return a VerificationReport, or None when
+        verification is disabled for this run.
+
+        Never raises — a failed verifier produces a STATUS_ERROR report
+        the caller can surface or ignore.
+        """
+        cfg = self._verification_config()
+        plan_mode = getattr(self, "_plan_mode", None)
+        plan_path_obj = None
+        # auto_when_plan must fire while Plan Mode is active AND on
+        # the immediate execution turns after /exit-plan (when the
+        # captured plan is being acted on).  We use a transient
+        # ``executing_plan`` flag set by /exit-plan; it's cleared
+        # after the first VERIFIED so subsequent unrelated chat
+        # turns don't keep paying for verifier LLM calls.  Prior
+        # code triggered verification for the entire session because
+        # plan_path persisted indefinitely.
+        if plan_mode is not None and (
+            plan_mode.enabled
+            or getattr(plan_mode, "executing_plan", False)
+        ) and plan_mode.plan_path is not None:
+            plan_path_obj = plan_mode.plan_path
+        elif plan_path:
+            from pathlib import Path as _P
+            plan_path_obj = _P(plan_path)
+
+        if not cfg["enabled"] and not (cfg["auto_when_plan"] and plan_path_obj is not None):
+            return None
+
+        from agent.verification import (
+            VERIFIER_SYSTEM_PROMPT, build_verifier_user_prompt,
+            parse_verification_response, VerificationReport, STATUS_ERROR,
+        )
+
+        plan_text: Optional[str] = None
+        if plan_path_obj is not None:
+            try:
+                plan_text = plan_path_obj.read_text(encoding="utf-8")
+            except OSError:
+                plan_text = None
+
+        user_prompt = build_verifier_user_prompt(
+            plan_text=plan_text,
+            final_response=final_response,
+            git_diff=self._capture_git_diff(),
+            test_output=test_output,
+        )
+        messages = [
+            {"role": "system", "content": VERIFIER_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ]
+        # Consensus mode — run multiple verifiers in parallel and vote.
+        consensus_cfg = cfg.get("consensus") or {}
+        if consensus_cfg.get("enabled") and consensus_cfg.get("models"):
+            from concurrent.futures import ThreadPoolExecutor
+            from agent.verification import aggregate_consensus
+            models = list(consensus_cfg["models"])
+            quorum = consensus_cfg["quorum_required"]
+            reports_list: list = []
+
+            def _verify_one(model_name: str) -> VerificationReport:
+                try:
+                    text = self._call_verifier_llm(
+                        messages,
+                        model=model_name,
+                        provider=cfg["provider"],
+                        max_tokens=cfg["max_tokens"],
+                    )
+                    return parse_verification_response(text)
+                except Exception as exc:
+                    return VerificationReport(
+                        status=STATUS_ERROR,
+                        summary=f"verifier ({model_name}) failed: {exc}",
+                    )
+
+            with ThreadPoolExecutor(max_workers=len(models)) as pool:
+                futures = [pool.submit(_verify_one, m) for m in models]
+                for f in futures:
+                    reports_list.append(f.result())
+            consensus = aggregate_consensus(
+                reports_list, quorum_required=quorum, models_used=models,
+            )
+            # Collapse the consensus into a flat VerificationReport so
+            # downstream callers (rework loop, audit) keep the same API.
+            flat = VerificationReport(
+                status=consensus.status,
+                summary=(consensus.summary
+                         or f"consensus={consensus.voted_status_counts}"),
+                issues=list(consensus.issues),
+            )
+            _audit_verification_event(self, flat)
+            return flat
+
+        # Single-verifier path (default).
+        try:
+            response_text = self._call_verifier_llm(
+                messages,
+                model=cfg["model"],
+                provider=cfg["provider"],
+                max_tokens=cfg["max_tokens"],
+            )
+        except Exception as exc:
+            logger.warning("verifier dispatch failed: %s", exc)
+            report = VerificationReport(
+                status=STATUS_ERROR,
+                summary=f"verifier dispatch failed: {exc}",
+            )
+            _audit_verification_event(self, report)
+            return report
+        report = parse_verification_response(response_text)
+        _audit_verification_event(self, report)
+        return report
+
+    def _get_hook_registry(self):
+        """Lazy-load the user-defined hook registry on first use.
+
+        Failure to load (malformed JSON, missing trust, etc.) leaves
+        an empty registry installed so subsequent calls are no-ops.
+        """
+        if self._hook_registry_loaded:
+            return self._hook_registry
+        self._hook_registry_loaded = True
+        try:
+            from agent.hooks import load_hook_registry
+            registry, report = load_hook_registry()
+            self._hook_registry = registry
+            self._hook_load_report = report
+            if len(registry) > 0:
+                logger.info("Loaded %d user-defined hook(s): %s",
+                            len(registry), registry.summary())
+            for warn in report.warnings():
+                logger.warning("hooks: %s", warn)
+        except Exception as exc:
+            logger.warning("Failed to load user hook registry: %s", exc)
+            try:
+                from agent.hooks import HookRegistry
+                self._hook_registry = HookRegistry.empty()
+            except Exception:
+                self._hook_registry = None
+        return self._hook_registry
+
+    #: Bridge map from new Claude-Code-style event names to the
+    #: canonical Hermes invoke_hook() names that shell_hooks /
+    #: Python-plugin authors listen for.  Only events whose canonical
+    #: counterpart is otherwise un-fired in production are bridged here;
+    #: PreToolUse/SessionEnd skip the bridge to avoid double-firing
+    #: with the existing production sites that already fire
+    #: pre_tool_call / on_session_end.
+    _HOOK_BRIDGE: dict[str, str] = {
+        "PostToolUse": "post_tool_call",
+        "SessionStart": "on_session_start",
+        "SubagentStop": "subagent_stop",
+        "UserPromptSubmit": "user_prompt_submit",
+        "Stop": "stop",
+    }
+
+    def _fire_hook(self, event: str, **payload):
+        """Fire a hook event.  Returns a HookOutcome; never raises.
+
+        Designed for fire-and-forget call sites — the caller can inspect
+        the returned outcome for ``blocked``, ``transformed_args``, or
+        ``additional_context`` but is not required to.
+
+        Bridge: for events that have a canonical Hermes counterpart
+        that's defined in VALID_HOOKS but not actually fired anywhere
+        else in production, this method also dispatches via the plugin
+        manager's ``invoke_hook`` so shell_hooks and Python plugins see
+        them too.  See ``_HOOK_BRIDGE`` for the mapping rationale.
+
+        Also writes one structured line to the audit log (when
+        ``audit.enabled: true``) so operators get a JSONL record of
+        every fired event.  Audit writes are best-effort and never
+        propagate failures.
+        """
+        # Audit-log the event before dispatching hooks — even a
+        # hook-disabled session benefits from the trace.
+        try:
+            from agent import audit_log
+            audit_log.write_event(
+                event,
+                session_id=str(getattr(self, "session_id", "") or ""),
+                data={k: v for k, v in payload.items() if v is not None},
+            )
+        except Exception:
+            pass
+
+        try:
+            from agent.hooks import HookOutcome, run_hooks
+        except Exception as exc:
+            logger.debug("hooks module unavailable for %s: %s", event, exc)
+            return None
+
+        # Bridge: route to invoke_hook for events whose Hermes-canonical
+        # counterpart is otherwise dormant in production.
+        canonical = self._HOOK_BRIDGE.get(event)
+        if canonical is not None:
+            try:
+                from hermes_cli.plugins import invoke_hook as _invoke_hook
+                # Map our payload keys to the Hermes-canonical names so
+                # existing shell_hooks / plugin authors don't need to
+                # learn our schema.
+                bridge_kwargs: dict = {
+                    "session_id": str(getattr(self, "session_id", "") or ""),
+                }
+                if "tool" in payload:
+                    bridge_kwargs["tool_name"] = payload["tool"]
+                if "args" in payload:
+                    bridge_kwargs["args"] = payload["args"] or {}
+                if "result" in payload:
+                    bridge_kwargs["result"] = payload["result"]
+                if "agent_name" in payload:
+                    bridge_kwargs["agent_name"] = payload["agent_name"]
+                if "final_response" in payload:
+                    bridge_kwargs["final_response"] = payload["final_response"]
+                _invoke_hook(canonical, **bridge_kwargs)
+            except Exception as exc:
+                logger.debug("hook bridge to %s failed: %s", canonical, exc)
+
+        try:
+            registry = self._get_hook_registry()
+            if registry is None or not registry.has_any(event):
+                return HookOutcome()
+            return run_hooks(
+                registry,
+                event,
+                session_id=str(getattr(self, "session_id", "") or ""),
+                cwd=os.getcwd(),
+                hermes_version=os.environ.get("HERMES_VERSION", ""),
+                **payload,
+            )
+        except Exception as exc:
+            logger.warning("Failed to fire %s hook: %s", event, exc)
+            return HookOutcome()
 
     def _hydrate_todo_store(self, history: List[Dict[str, Any]]) -> None:
         """
@@ -10483,9 +10864,14 @@ class AIAgent:
 
         New DELEGATE_TASK_SCHEMA fields only need to be added here to reach all
         invocation paths (concurrent, sequential, inline).
+
+        Fires the user-defined ``SubagentStop`` hook after the delegated
+        agent finishes so external observers can post-process the
+        subagent's final response (e.g. archive trajectories, score
+        outputs, gate parent loop on subagent success).
         """
         from tools.delegate_tool import delegate_task as _delegate_task
-        return _delegate_task(
+        result = _delegate_task(
             goal=function_args.get("goal"),
             context=function_args.get("context"),
             toolsets=function_args.get("toolsets"),
@@ -10494,13 +10880,103 @@ class AIAgent:
             acp_command=function_args.get("acp_command"),
             acp_args=function_args.get("acp_args"),
             role=function_args.get("role"),
+            subagent_type=function_args.get("subagent_type"),
+            parent_agent=self,
+        )
+        try:
+            self._fire_hook(
+                "SubagentStop",
+                agent_name=str(function_args.get("role") or "subagent"),
+                final_response=result if isinstance(result, str) else str(result),
+            )
+        except Exception:
+            pass
+        return result
+
+    def _dispatch_orchestrate_tasks(self, function_args: dict) -> str:
+        """Single call site for orchestrate_tasks dispatch.
+
+        The registry-routed path can't inject ``parent_agent`` (registry.dispatch
+        only threads ``task_id`` / ``user_task`` / ``enabled_tools``), so this
+        method is the explicit special-case that gives the orchestrator a
+        live AIAgent to delegate from — mirroring _dispatch_delegate_task.
+
+        Without this hook, ``orchestrate_tasks`` invoked from the agent loop
+        always returns ``{"error": "orchestrate_tasks requires a parent agent
+        context."}``, making the whole parallel-DAG feature dead from the
+        model's perspective.
+        """
+        from tools.orchestrate_tool import orchestrate_tasks as _orchestrate
+        return _orchestrate(
+            tasks=function_args.get("tasks") or [],
+            fanout=int(function_args.get("fanout") or 4),
             parent_agent=self,
         )
 
     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,
                      tool_call_id: Optional[str] = None, messages: list = None,
                      pre_tool_block_checked: bool = False) -> str:
-        """Invoke a single tool and return the result string. No display logic.
+        """Invoke a single tool, wrapping the dispatch with user-defined
+        ``PreToolUse`` and ``PostToolUse`` hooks.
+
+        ``PreToolUse`` can block (exit 2 → refusal returned to model) or
+        transform the tool's args (stdout JSON ``decision: "transform"``
+        with new ``args``).  ``PostToolUse`` is fire-and-forget for
+        side-effecting commands (lint, format, scan); any errors it
+        surfaces are logged but do not change the tool result the model
+        sees.
+        """
+        # Plan Mode gate: refuse any tool not on the read-only allowlist.
+        # Higher priority than the plugin pre-tool-block hook so a /plan
+        # session can't be subverted by an over-permissive plugin.
+        plan_mode = getattr(self, "_plan_mode", None)
+        if plan_mode is not None and plan_mode.enabled and not plan_mode.is_tool_allowed(
+            function_name, args=function_args,
+        ):
+            return json.dumps(
+                {"error": plan_mode.refusal_for(function_name)},
+                ensure_ascii=False,
+            )
+
+        # User-defined PreToolUse hook — fires before plugin block check
+        # and dispatch.  Block short-circuits with the hook's reason.
+        # Transform replaces the args before dispatch.
+        pre_outcome = self._fire_hook(
+            "PreToolUse", tool=function_name, args=function_args,
+        )
+        if pre_outcome is not None and pre_outcome.blocked:
+            return json.dumps(
+                {"error": pre_outcome.block_reason or "blocked by PreToolUse hook"},
+                ensure_ascii=False,
+            )
+        if pre_outcome is not None and pre_outcome.transformed_args is not None:
+            function_args = pre_outcome.transformed_args
+        if pre_outcome is not None and pre_outcome.errors:
+            logger.warning("PreToolUse hook errors for %s: %s",
+                           function_name, "; ".join(pre_outcome.errors))
+
+        result = self._invoke_tool_dispatch(
+            function_name, function_args, effective_task_id,
+            tool_call_id=tool_call_id, messages=messages,
+            pre_tool_block_checked=pre_tool_block_checked,
+        )
+
+        # User-defined PostToolUse hook — fires after the tool produces
+        # its result.  Best-effort: errors are logged, the tool result
+        # passes through unchanged so the model's view is stable.
+        post_outcome = self._fire_hook(
+            "PostToolUse", tool=function_name, args=function_args, result=result,
+        )
+        if post_outcome is not None and post_outcome.errors:
+            logger.warning("PostToolUse hook errors for %s: %s",
+                           function_name, "; ".join(post_outcome.errors))
+
+        return result
+
+    def _invoke_tool_dispatch(self, function_name: str, function_args: dict, effective_task_id: str,
+                              tool_call_id: Optional[str] = None, messages: list = None,
+                              pre_tool_block_checked: bool = False) -> str:
+        """Pure dispatch for a single tool call. No hooks, no plan mode gate.
 
         Handles both agent-level tools (todo, memory, etc.) and registry-dispatched
         tools. Used by the concurrent execution path; the sequential path retains
@@ -10575,6 +11051,8 @@ class AIAgent:
             )
         elif function_name == "delegate_task":
             return self._dispatch_delegate_task(function_args)
+        elif function_name == "orchestrate_tasks":
+            return self._dispatch_orchestrate_tasks(function_args)
         else:
             return handle_function_call(
                 function_name, function_args, effective_task_id,
@@ -10672,21 +11150,34 @@ class AIAgent:
 
             block_result = None
             blocked_by_guardrail = False
-            try:
-                from hermes_cli.plugins import get_pre_tool_call_block_message
-                block_message = get_pre_tool_call_block_message(
-                    function_name, function_args, task_id=effective_task_id or "",
-                )
-            except Exception:
-                block_message = None
 
-            if block_message is not None:
-                block_result = json.dumps({"error": block_message}, ensure_ascii=False)
-            else:
-                guardrail_decision = self._tool_guardrails.before_call(function_name, function_args)
-                if not guardrail_decision.allows_execution:
-                    block_result = self._guardrail_block_result(guardrail_decision)
-                    blocked_by_guardrail = True
+            # Plan Mode gate: refuse mutating tools when /plan is active.
+            # Mirrors the gate inside _invoke_tool so the concurrent
+            # short-circuit path doesn't bypass plan-mode protection.
+            plan_mode = getattr(self, "_plan_mode", None)
+            if (plan_mode is not None and plan_mode.enabled
+                    and not plan_mode.is_tool_allowed(function_name, args=function_args)):
+                block_result = json.dumps(
+                    {"error": plan_mode.refusal_for(function_name)},
+                    ensure_ascii=False,
+                )
+
+            if block_result is None:
+                try:
+                    from hermes_cli.plugins import get_pre_tool_call_block_message
+                    block_message = get_pre_tool_call_block_message(
+                        function_name, function_args, task_id=effective_task_id or "",
+                    )
+                except Exception:
+                    block_message = None
+
+                if block_message is not None:
+                    block_result = json.dumps({"error": block_message}, ensure_ascii=False)
+                else:
+                    guardrail_decision = self._tool_guardrails.before_call(function_name, function_args)
+                    if not guardrail_decision.allows_execution:
+                        block_result = self._guardrail_block_result(guardrail_decision)
+                        blocked_by_guardrail = True
 
             parsed_calls.append((tool_call, function_name, function_args, block_result, blocked_by_guardrail))
 
@@ -11142,7 +11633,47 @@ class AIAgent:
 
             tool_start_time = time.time()
 
-            if _block_msg is not None:
+            # Plan Mode gate + user-defined PreToolUse hook.
+            # The concurrent path runs these inside _invoke_tool; the
+            # sequential path historically inlined its own dispatch and
+            # skipped both, allowing single-tool turns to escape /plan
+            # lockdown and bypass PreToolUse hooks entirely.  Apply the
+            # same gates here so the lockdown / hook contracts hold for
+            # both batch and single-tool turns.
+            _seq_plan_refusal: Optional[str] = None
+            _seq_pre_block: Optional[str] = None
+            if _block_msg is None and _guardrail_block_decision is None:
+                _plan_mode_state = getattr(self, "_plan_mode", None)
+                if (_plan_mode_state is not None
+                        and _plan_mode_state.enabled
+                        and not _plan_mode_state.is_tool_allowed(
+                            function_name, args=function_args,
+                        )):
+                    _seq_plan_refusal = _plan_mode_state.refusal_for(function_name)
+                else:
+                    _seq_pre_outcome = self._fire_hook(
+                        "PreToolUse", tool=function_name, args=function_args,
+                    )
+                    if _seq_pre_outcome is not None:
+                        if _seq_pre_outcome.blocked:
+                            _seq_pre_block = (
+                                _seq_pre_outcome.block_reason
+                                or "blocked by PreToolUse hook"
+                            )
+                        elif _seq_pre_outcome.transformed_args is not None:
+                            function_args = _seq_pre_outcome.transformed_args
+
+            if _seq_plan_refusal is not None:
+                function_result = json.dumps(
+                    {"error": _seq_plan_refusal}, ensure_ascii=False,
+                )
+                tool_duration = 0.0
+            elif _seq_pre_block is not None:
+                function_result = json.dumps(
+                    {"error": _seq_pre_block}, ensure_ascii=False,
+                )
+                tool_duration = 0.0
+            elif _block_msg is not None:
                 # Tool blocked by plugin policy — return error without executing.
                 function_result = json.dumps({"error": _block_msg}, ensure_ascii=False)
                 tool_duration = 0.0
@@ -11240,6 +11771,14 @@ class AIAgent:
                         spinner.stop(cute_msg)
                     elif self._should_emit_quiet_tool_messages():
                         self._vprint(f"  {cute_msg}")
+            elif function_name == "orchestrate_tasks":
+                # Sequential dispatch path for the parallel-DAG tool —
+                # mirrors the concurrent branch.  parent_agent is
+                # threaded explicitly because registry.dispatch can't.
+                function_result = self._dispatch_orchestrate_tasks(function_args)
+                tool_duration = time.time() - tool_start_time
+                if self._should_emit_quiet_tool_messages():
+                    self._vprint(f"  {_get_cute_tool_message_impl('orchestrate_tasks', function_args, tool_duration, result=function_result)}")
             elif self._context_engine_tool_names and function_name in self._context_engine_tool_names:
                 # Context engine tools (lcm_grep, lcm_describe, lcm_expand, etc.)
                 spinner = None
@@ -11328,6 +11867,27 @@ class AIAgent:
                     function_result = f"Error executing tool '{function_name}': {tool_error}"
                     logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
                 tool_duration = time.time() - tool_start_time
+
+            # User-defined PostToolUse hook — fires after every
+            # sequential-path tool result is computed.  Mirrors the
+            # concurrent path's _invoke_tool wrapper.  Best-effort:
+            # errors are logged, result passes through unchanged so
+            # the model's view stays stable.
+            try:
+                _post_outcome = self._fire_hook(
+                    "PostToolUse",
+                    tool=function_name,
+                    args=function_args,
+                    result=function_result if isinstance(function_result, str)
+                    else str(function_result),
+                )
+                if _post_outcome is not None and _post_outcome.errors:
+                    logger.warning(
+                        "PostToolUse hook errors for %s: %s",
+                        function_name, "; ".join(_post_outcome.errors),
+                    )
+            except Exception:
+                pass
 
             if isinstance(function_result, str):
                 result_preview = function_result if self.verbose_logging else (
@@ -11825,6 +12385,17 @@ class AIAgent:
             _msg_preview,
         )
 
+        # User-defined SessionStart hook — fires exactly once per agent
+        # instance, on the first run_conversation call.  Useful for
+        # injecting per-session telemetry, sourcing env files, or
+        # warming caches.  Best-effort: failures are logged.
+        if not getattr(self, "_session_start_fired", False):
+            self._session_start_fired = True
+            try:
+                self._fire_hook("SessionStart")
+            except Exception:
+                pass
+
         # Initialize conversation (copy to avoid mutating the caller's list)
         messages = list(conversation_history) if conversation_history else []
 
@@ -11890,6 +12461,79 @@ class AIAgent:
             if self._turns_since_memory >= self._memory_nudge_interval:
                 _should_review_memory = True
                 self._turns_since_memory = 0
+
+        # Lessons-learned injection — on the FIRST user message of a
+        # session, look up lessons relevant to the prompt and prepend
+        # them as a system-prompt-style preamble inside the user
+        # message.  Cheap fuzzy retrieval (no embeddings); the lesson
+        # corpus is hand-curated from past rework cycles.  Skipped on
+        # subsequent turns to keep cost predictable.
+        if not getattr(self, "_lessons_preamble_injected", False):
+            self._lessons_preamble_injected = True
+            try:
+                from agent.lessons import (
+                    format_lessons_preamble, relevant_lessons,
+                )
+                lessons_hit = relevant_lessons(user_message, limit=3)
+                if lessons_hit:
+                    preamble = format_lessons_preamble(lessons_hit)
+                    if preamble:
+                        user_message = (
+                            f"<lessons-learned>\n{preamble}\n</lessons-learned>\n\n"
+                            f"{user_message}"
+                        )
+                        logger.info(
+                            "injected %d lesson(s) from prior sessions "
+                            "into the user prompt",
+                            len(lessons_hit),
+                        )
+            except Exception as exc:
+                logger.debug("lessons injection failed: %s", exc)
+
+        # User-defined UserPromptSubmit hook — fires before the message
+        # hits the transcript or the model.  Exit 2 (block) returns
+        # immediately with a synthetic assistant response so the caller
+        # sees the refusal reason.  additional_context entries are
+        # prepended to the user message inside a <hook-context> envelope
+        # so the model can use them but they're visually distinct.
+        ups_outcome = self._fire_hook(
+            "UserPromptSubmit", user_message=user_message,
+        )
+        if ups_outcome is not None and ups_outcome.blocked:
+            block_reason = ups_outcome.block_reason or "blocked by UserPromptSubmit hook"
+            return {
+                "final_response": f"[Blocked by hook] {block_reason}",
+                "last_reasoning": None,
+                "messages": messages,
+                "api_calls": 0,
+                "completed": False,
+                "turn_exit_reason": "user_prompt_blocked",
+                "partial": False,
+                "interrupted": False,
+                "response_previewed": False,
+                "model": self.model,
+                "provider": self.provider,
+                "base_url": self.base_url,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+                "reasoning_tokens": 0,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "last_prompt_tokens": 0,
+                "estimated_cost_usd": 0.0,
+                "cost_status": "unknown",
+                "cost_source": None,
+                "user_prompt_block": {"reason": block_reason},
+            }
+        if ups_outcome is not None and ups_outcome.additional_context:
+            _ctx_block = "\n".join(ups_outcome.additional_context).strip()
+            if _ctx_block:
+                user_message = (
+                    f"<hook-context>\n{_ctx_block}\n</hook-context>\n\n{user_message}"
+                )
 
         # Add user message
         user_msg = {"role": "user", "content": user_message}
@@ -15537,6 +16181,48 @@ class AIAgent:
             )
         except Exception as exc:
             logger.warning("on_session_end hook failed: %s", exc)
+
+        # User-defined Stop hook — runs after a final non-tool response is
+        # emitted and lets external commands gate completion (e.g. force a
+        # test run before the agent declares "done").  Exit 2 surfaces the
+        # block reason into result["stop_hook_block"] so callers can decide
+        # whether to re-enter the loop with the reason as a follow-up turn.
+        stop_hook_context_lines: list[str] = []
+        if final_response and not interrupted:
+            stop_outcome = self._fire_hook("Stop", final_response=final_response)
+            if stop_outcome is not None:
+                if stop_outcome.blocked:
+                    result["stop_hook_block"] = {
+                        "reason": stop_outcome.block_reason or "blocked by Stop hook",
+                    }
+                if stop_outcome.additional_context:
+                    stop_hook_context_lines = list(stop_outcome.additional_context)
+                    result["stop_hook_context"] = stop_hook_context_lines
+                if stop_outcome.errors:
+                    logger.warning("Stop hook errors: %s",
+                                   "; ".join(stop_outcome.errors))
+
+        # Autonomous self-verification — only runs when verification is
+        # enabled in config OR a Plan Mode artifact exists for this
+        # session (verification.auto_when_plan).  Skipped when the Stop
+        # hook already blocked: the operator's hook is the authority.
+        if (final_response and not interrupted
+                and not result.get("stop_hook_block")):
+            try:
+                _test_output = "\n\n".join(stop_hook_context_lines) if stop_hook_context_lines else None
+                _report = self._run_verifier(
+                    final_response=final_response,
+                    test_output=_test_output,
+                )
+                if _report is not None:
+                    result["verification"] = _report.to_dict()
+                    if _report.needs_rework:
+                        from agent.verification import render_rework_message
+                        plan_mode = getattr(self, "_plan_mode", None)
+                        plan_path = plan_mode.plan_path if plan_mode is not None else None
+                        result["rework_message"] = render_rework_message(_report, plan_path)
+            except Exception as exc:
+                logger.warning("verification pass failed: %s", exc)
 
         return result
 

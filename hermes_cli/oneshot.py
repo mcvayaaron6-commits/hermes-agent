@@ -126,8 +126,11 @@ def run_oneshot(
     model: Optional[str] = None,
     provider: Optional[str] = None,
     toolsets: object = None,
+    output_format: str = "text",
+    fail_on_rework: bool = True,
+    auto_rework: bool = False,
 ) -> int:
-    """Execute a single prompt and print only the final content block.
+    """Execute a single prompt and print the final content block.
 
     Args:
         prompt: The user message to send.
@@ -137,6 +140,9 @@ def run_oneshot(
             HERMES_INFERENCE_PROVIDER env var, then config.yaml's model.provider,
             then "auto".
         toolsets: Optional comma-separated string or iterable of toolsets.
+        output_format: ``"text"`` (default, just the final response) or
+            ``"json"`` (structured envelope with response + telemetry +
+            verification status; useful for CI / scripted pipelines).
 
     Returns the exit code.  Caller should sys.exit() with the return.
     """
@@ -176,20 +182,91 @@ def run_oneshot(
     real_stdout = sys.stdout
     devnull = open(os.devnull, "w", encoding="utf-8")
 
+    want_json = (output_format or "text").lower() == "json"
+    if auto_rework and not want_json:
+        # Auto-rework only makes sense when the caller is reading the
+        # structured envelope.  In text mode the loop has no caller to
+        # decide on the rework, so this combination is almost certainly
+        # a flag mistake — warn and ignore rather than silently looping.
+        sys.stderr.write(
+            "hermes -z: --auto-rework requires --output-format json; "
+            "ignoring auto-rework (text mode emits the final response "
+            "regardless of verification state).\n"
+        )
+        auto_rework = False
+    result_dict: Optional[dict] = None
+    rework_history: list = []
     try:
         with redirect_stdout(devnull), redirect_stderr(devnull):
-            response = _run_agent(
-                prompt,
-                model=model,
-                provider=provider,
-                toolsets=explicit_toolsets,
-                use_config_toolsets=use_config_toolsets,
-            )
+            if want_json:
+                response, result_dict = _run_agent_with_details(
+                    prompt,
+                    model=model,
+                    provider=provider,
+                    toolsets=explicit_toolsets,
+                    use_config_toolsets=use_config_toolsets,
+                )
+                # Auto-rework loop: while the verifier surfaces
+                # NEEDS_REWORK and we still have attempts left, re-run
+                # with the rework_message as the next user turn.  The
+                # rework_history list tracks each attempt's verifier
+                # verdict + token cost so the final envelope tells the
+                # caller exactly how many cycles it took.
+                if auto_rework:
+                    max_attempts = _resolve_auto_rework_max_attempts()
+                    attempt = 1
+                    while (
+                        attempt < max_attempts
+                        and isinstance(result_dict, dict)
+                        and (result_dict.get("verification") or {}).get("status") == "NEEDS_REWORK"
+                        and result_dict.get("rework_message")
+                    ):
+                        rework_history.append({
+                            "attempt": attempt,
+                            "verification": dict(result_dict.get("verification") or {}),
+                            "input_tokens": result_dict.get("input_tokens"),
+                            "output_tokens": result_dict.get("output_tokens"),
+                            "estimated_cost_usd": result_dict.get("estimated_cost_usd"),
+                        })
+                        next_prompt = result_dict["rework_message"]
+                        response, result_dict = _run_agent_with_details(
+                            next_prompt,
+                            model=model,
+                            provider=provider,
+                            toolsets=explicit_toolsets,
+                            use_config_toolsets=use_config_toolsets,
+                        )
+                        attempt += 1
+            else:
+                response = _run_agent(
+                    prompt,
+                    model=model,
+                    provider=provider,
+                    toolsets=explicit_toolsets,
+                    use_config_toolsets=use_config_toolsets,
+                )
     finally:
         try:
             devnull.close()
         except Exception:
             pass
+
+    if want_json:
+        import json as _json
+        envelope = _build_json_envelope(prompt, response, result_dict)
+        if rework_history:
+            envelope["rework_history"] = rework_history
+            envelope["total_attempts"] = len(rework_history) + 1
+        real_stdout.write(_json.dumps(envelope, ensure_ascii=False, default=str))
+        real_stdout.write("\n")
+        real_stdout.flush()
+        # Exit non-zero when the verifier surfaced NEEDS_REWORK so CI
+        # pipelines can gate on it.  Plain text mode doesn't have this
+        # because there's nowhere to put the signal.  Disable via
+        # --no-fail-on-rework when verification is informational.
+        if fail_on_rework and envelope.get("verification", {}).get("status") == "NEEDS_REWORK":
+            return 1
+        return 0
 
     if response:
         real_stdout.write(response)
@@ -197,6 +274,60 @@ def run_oneshot(
             real_stdout.write("\n")
         real_stdout.flush()
     return 0
+
+
+def _resolve_auto_rework_max_attempts() -> int:
+    """Read verification.max_attempts from config; default 2."""
+    try:
+        from hermes_cli.config import load_config
+        cfg = (load_config().get("verification") or {})
+        return max(1, int(cfg.get("max_attempts", 2)))
+    except Exception:
+        return 2
+
+
+def _build_json_envelope(prompt: str, response: str, result: Optional[dict]) -> dict:
+    """Build the structured envelope emitted for --output-format json.
+
+    Keys are stable for scripted consumers — never silently rename;
+    if you must change one, ship a new key alongside and deprecate
+    the old.
+    """
+    envelope: dict = {
+        "type": "oneshot_result",
+        "prompt": prompt,
+        "final_response": response or "",
+    }
+    if not isinstance(result, dict):
+        return envelope
+    # Telemetry every CI pipeline cares about.
+    for key in (
+        "model", "provider", "base_url",
+        "input_tokens", "output_tokens",
+        "cache_read_tokens", "cache_write_tokens",
+        "reasoning_tokens", "total_tokens",
+        "estimated_cost_usd", "cost_status",
+        "api_calls", "completed", "interrupted",
+    ):
+        if key in result:
+            envelope[key] = result[key]
+    # Verification status (when enabled / when a plan exists).  The
+    # rework_message is a complete user-turn-ready string that the
+    # caller can re-inject if they want to drive the autonomy loop
+    # from outside Hermes.
+    if "verification" in result:
+        envelope["verification"] = result["verification"]
+    if result.get("rework_message"):
+        envelope["rework_message"] = result["rework_message"]
+    # Stop hook outcomes.
+    if result.get("stop_hook_block"):
+        envelope["stop_hook_block"] = result["stop_hook_block"]
+    if result.get("stop_hook_context"):
+        envelope["stop_hook_context"] = result["stop_hook_context"]
+    # User-prompt-submit refusals.
+    if result.get("user_prompt_block"):
+        envelope["user_prompt_block"] = result["user_prompt_block"]
+    return envelope
 
 
 def _create_session_db_for_oneshot():
@@ -221,9 +352,16 @@ def _run_agent(
     provider: Optional[str] = None,
     toolsets: object = None,
     use_config_toolsets: bool = True,
-) -> str:
+    return_dict: bool = False,  # back-compat shim — see _run_agent_with_details
+) -> object:
     """Build an AIAgent exactly like a normal CLI chat turn would, then
-    run a single conversation.  Returns the final response string."""
+    run a single conversation.  Returns the final response string.
+
+    Back-compat: when ``return_dict=True`` (used internally by JSON
+    output mode), returns ``(response_string, result_dict)`` instead.
+    New callers should use ``_run_agent_with_details`` for the tuple
+    shape and leave this function as a plain ``-> str``.
+    """
     # Imports are local so they don't run when hermes is invoked for
     # other commands (keeps top-level CLI startup cheap).
     from hermes_cli.config import load_config
@@ -333,7 +471,34 @@ def _run_agent(
     agent.stream_delta_callback = None
     agent.tool_gen_callback = None
 
+    if return_dict:
+        # Back-compat shim — new callers should use _run_agent_with_details.
+        result = agent.run_conversation(prompt)
+        response = (result.get("final_response") or "") if isinstance(result, dict) else ""
+        return response, (result if isinstance(result, dict) else None)
     return agent.chat(prompt) or ""
+
+
+def _run_agent_with_details(
+    prompt: str,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+    toolsets: object = None,
+    use_config_toolsets: bool = True,
+) -> tuple:
+    """Variant of ``_run_agent`` that returns ``(response, result_dict)``.
+
+    Used by the JSON-output path so it can pull telemetry,
+    verification status, rework_message, etc. from the
+    ``run_conversation`` result.  Always returns a 2-tuple — the dict
+    may be ``None`` if dispatch went sideways but the response came
+    back through ``agent.chat`` as a fallback.
+    """
+    response, result = _run_agent(
+        prompt, model=model, provider=provider, toolsets=toolsets,
+        use_config_toolsets=use_config_toolsets, return_dict=True,
+    )
+    return response, result
 
 
 def _oneshot_clarify_callback(question: str, choices=None) -> str:

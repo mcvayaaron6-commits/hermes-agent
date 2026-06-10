@@ -682,6 +682,129 @@ DEFAULT_CONFIG = {
         "min_interval_hours": 24,
     },
 
+    # Plan Mode — first-class "investigate before mutating" toggle.  When
+    # on (via the `/plan <task>` slash command), the tool dispatcher
+    # refuses any tool not on the read-only allowlist until /exit-plan
+    # releases the gate.  Operators can widen or tighten the allowlist
+    # below.  See website/docs/user-guide/features/plan-mode.md.
+    "plan_mode": {
+        # Extra tools that should be allowed while in Plan Mode in
+        # addition to the built-in read-only allowlist.  Useful for
+        # team-specific static-analysis tools that are technically
+        # read-only but ship in your own plugins.
+        "allow_tools": [],
+        # Tools that should be blocked even though they're on the
+        # default allowlist.  Useful when, e.g., you don't want the
+        # agent fetching arbitrary URLs during planning.
+        "deny_tools": [],
+    },
+
+    # Audit log — structured JSONL record of every hook fire, plan-mode
+    # transition, and verifier verdict.  Off by default; turn on for
+    # production observability or post-mortem debugging.  See
+    # agent/audit_log.py for the schema.
+    "audit": {
+        # Master switch.  When false (default), audit writes are no-ops.
+        "enabled": False,
+        # Optional override for the log file path.  Defaults to
+        # <hermes_home>/logs/audit.jsonl.  Use an absolute path here
+        # if you want to ship logs to a different mount.
+        "path": None,
+        # Path to a file containing the HMAC signing key.  When set
+        # (or HERMES_AUDIT_HMAC_KEY env var is set), every audit line
+        # is HMAC-SHA256 signed over (prev_hash + content).  Verify
+        # via /audit verify or programmatically with
+        # agent.audit_log.verify_chain(signing_key=...).
+        #
+        # The chain (prev_hash linking) is always active when audit
+        # is enabled — even without a key it detects truncation,
+        # reordering, and edits.  HMAC raises the bar to "attacker
+        # must also have the key."
+        "hmac_key_file": None,
+    },
+
+    # Auto-skill-promotion thresholds — the compounding-intelligence
+    # engine that elevates clustered lessons into reusable skills, and
+    # heavily-used skills into specialised subagent profiles.  See
+    # agent/skill_promotion.py and
+    # website/docs/user-guide/features/skill-promotion.md.
+    "skill_promotion": {
+        # Minimum lessons that must cluster (share min_shared_tags
+        # tags pairwise) before a skill is proposed.  Below this,
+        # the pattern is too weak a signal to promote.
+        "lesson_threshold": 3,
+        # Minimum tag overlap required for two lessons to be in the
+        # same cluster.  Higher = stricter clustering, fewer but
+        # more specific promotions.
+        "min_shared_tags": 2,
+        # Minimum successful uses of a skill before it's proposed
+        # for promotion into a subagent profile.
+        "usage_threshold": 5,
+    },
+
+    # Named subagent profiles — operator-level controls.  See
+    # website/docs/user-guide/features/subagents.md.  Profiles live as
+    # markdown-with-frontmatter files under ~/.hermes/agents/ (user-
+    # global) and .hermes/agents/ (per-project).
+    "subagents": {
+        # When False, profiles loaded from a project-level
+        # .hermes/agents/ directory are ignored entirely.  Use this when
+        # you operate Hermes against untrusted repos and don't want
+        # repo-supplied prompts to influence delegated subagents
+        # (confused-deputy guard — profiles only inject system prompts,
+        # not arbitrary shell, but the prompt-injection blast radius
+        # is still real for agents that delegate on user input).
+        # User-global profiles in ~/.hermes/agents/ are always trusted.
+        "allow_project_profiles": True,
+    },
+
+    # Self-verification — when the model emits a final non-tool
+    # response, an LLM verifier (using the same provider as the main
+    # agent unless overridden below) re-reads the plan + diff + any
+    # Stop-hook output and emits a strict JSON VERIFIED / NEEDS_REWORK
+    # verdict.  NEEDS_REWORK surfaces a rework message the caller can
+    # re-inject as the next user turn so the agent fixes the gaps
+    # before the answer reaches the user.  See
+    # website/docs/user-guide/features/verification.md.
+    "verification": {
+        # Master switch.  Default off; opt in here or via /verify.
+        "enabled": False,
+        # When True (default), verification runs automatically whenever
+        # a Plan Mode artifact exists for the session — typing /plan
+        # already opts you into careful-mode, no need to flip this
+        # switch separately.
+        "auto_when_plan": True,
+        # Number of NEEDS_REWORK cycles to attempt before giving up
+        # and surfacing the verifier report alongside the original
+        # answer.
+        "max_attempts": 2,
+        # Provider/model overrides for the verifier subagent.  null
+        # means "use the agent's main provider/model."  Routing
+        # verification to a cheaper model (e.g. Haiku when running
+        # on Opus) is usually a cost win without losing rigor —
+        # the verifier grades concrete evidence, not generates it.
+        "provider": None,
+        "model": None,
+        "max_tokens": 2000,
+        # Differential verification — when enabled, _run_verifier
+        # spawns one verifier per model in `consensus.models` in
+        # parallel and aggregates via quorum voting.  Safety-first
+        # tiebreaker: NEEDS_REWORK wins over VERIFIED when both
+        # reach quorum.  Trades ~3x verifier tokens for much higher
+        # trust on high-stakes tasks.
+        "consensus": {
+            "enabled": False,
+            # List of model identifiers (Hermes resolves provider
+            # via the usual rules).  Example:
+            #   ["anthropic/claude-sonnet-4-6", "openai/gpt-5",
+            #    "anthropic/claude-haiku-4-5"]
+            "models": [],
+            # How many voters must agree for that status to win.
+            # Typical: 2 (of 3 models).  Higher = stricter.
+            "quorum_required": 2,
+        },
+    },
+
     # Maximum characters returned by a single read_file call.  Reads that
     # exceed this are rejected with guidance to use offset+limit.
     # 100K chars ≈ 25–35K tokens across typical tokenisers.

@@ -2546,6 +2546,16 @@ class HermesCLI:
         
         # Conversation state
         self.conversation_history: List[Dict[str, Any]] = []
+        # Verifier auto-rework state (see _handle_response post-processing).
+        self._verification_rework_count = 0
+        # Buffered task/response/complaint captured on the first rework
+        # of a task, used to write a lesson if the rework loop converges
+        # on VERIFIED.  Cleared on VERIFIED or on max_attempts hit.
+        self._lessons_capture_buffer = None
+        # Track how many promotion candidates were visible last time
+        # we checked, so the post-lesson nudge fires once per new
+        # pattern rather than every rework cycle.
+        self._last_promotion_candidate_count = 0
         self.session_start = datetime.now()
         self._resumed = False
         # Per-prompt elapsed timer — started at the beginning of each chat turn,
@@ -4716,6 +4726,636 @@ class HermesCLI:
         except ValueError:
             # Treat as a git hash
             return ref
+
+    # ------------------------------------------------------------------
+    # Plan Mode / Hooks / Verification slash commands
+    # ------------------------------------------------------------------
+
+    def _handle_plan_command(self, command: str) -> None:
+        """Enter Plan Mode and prime the agent to investigate-and-plan.
+
+        Syntax:
+            /plan <task description>
+
+        Turns on the agent's PlanModeState, computes a per-cwd plan
+        artifact path (.hermes/plans/<slug>-<ts>.md), and queues a
+        synthetic user message that tells the model it's in plan mode
+        and what the task is.  The tool dispatcher will refuse any
+        mutating tool until /exit-plan releases the gate.
+        """
+        if not hasattr(self, "agent") or not self.agent:
+            print("  No active agent session.")
+            return
+        plan_mode = getattr(self.agent, "_plan_mode", None)
+        if plan_mode is None:
+            print("  Plan Mode is unavailable in this build.")
+            return
+        parts = command.split(None, 1)
+        task = parts[1].strip() if len(parts) > 1 else ""
+        if not task:
+            print("  Usage: /plan <task description>")
+            return
+        if plan_mode.enabled:
+            print(f"  Already in Plan Mode (task: {plan_mode.task!r}). "
+                  f"Use /exit-plan to leave or /plan-show to view.")
+            return
+        from pathlib import Path as _P
+        from agent.plan_mode import default_plan_path, PLAN_MODE_SYSTEM_PROMPT
+        cwd = _P(os.getenv("TERMINAL_CWD", os.getcwd()))
+        plans_dir = cwd / ".hermes" / "plans"
+        plan_path = default_plan_path(plans_dir, task)
+        plan_mode.enter(task=task, plan_path=plan_path)
+        try:
+            from agent import audit_log
+            audit_log.write_event(
+                audit_log.EVENT_PLAN_MODE_ENTER,
+                session_id=str(getattr(self.agent, "session_id", "") or ""),
+                data={"task": task, "plan_path": str(plan_path)},
+            )
+        except Exception:
+            pass
+        print(f"  📋 Plan Mode active — read-only tools only.")
+        print(f"     Task: {task}")
+        print(f"     Plan will be saved to: {plan_path}")
+        print(f"     Investigate using read_file, search_files, web_search, ...")
+        print(f"     Use /exit-plan when ready to execute, /cancel-plan to abort.")
+        # Queue a synthetic user message that primes the model.
+        try:
+            self._pending_input.put(
+                f"{PLAN_MODE_SYSTEM_PROMPT}\n\n## Your task\n\n{task}"
+            )
+        except Exception as exc:
+            print(f"  (could not queue plan-mode prompt: {exc})")
+
+    def _handle_exit_plan_command(self) -> None:
+        """Leave Plan Mode, persist the latest assistant message as the
+        plan artifact, seed the todo list, and prime the agent for Act
+        Mode.
+        """
+        if not hasattr(self, "agent") or not self.agent:
+            print("  No active agent session.")
+            return
+        plan_mode = getattr(self.agent, "_plan_mode", None)
+        if plan_mode is None or not plan_mode.enabled:
+            print("  Not currently in Plan Mode.")
+            return
+        plan_path = plan_mode.plan_path
+        # Find the most recent assistant message — that's the plan.
+        latest_plan_text = ""
+        try:
+            for msg in reversed(self.conversation_history or []):
+                if msg.get("role") == "assistant":
+                    latest_plan_text = (msg.get("content") or "").strip()
+                    if latest_plan_text:
+                        break
+        except Exception:
+            pass
+        if not latest_plan_text:
+            print("  No assistant response yet — investigate first, then /exit-plan.")
+            return
+        try:
+            from agent.plan_mode import (
+                PlanArtifact, parse_steps_from_markdown, write_plan_artifact,
+            )
+            artifact = PlanArtifact(task=plan_mode.task,
+                                    context=latest_plan_text)
+            artifact.steps = parse_steps_from_markdown(latest_plan_text)
+            if plan_path is not None:
+                plan_path.parent.mkdir(parents=True, exist_ok=True)
+                # Persist the raw markdown the model produced — preserves
+                # whatever structure the agent chose.  The artifact's
+                # render_markdown wraps it in our schema if needed.
+                plan_path.write_text(latest_plan_text, encoding="utf-8")
+            # Seed the agent's todo store from the parsed steps.
+            todos_seeded = 0
+            try:
+                if artifact.steps and hasattr(self.agent, "_todo_store"):
+                    from tools.todo_tool import todo_tool as _todo_tool
+                    seed = [
+                        {"id": i, "content": step.description,
+                         "status": "completed" if step.done else "pending"}
+                        for i, step in enumerate(artifact.steps, 1)
+                    ]
+                    _todo_tool(todos=seed, store=self.agent._todo_store)
+                    todos_seeded = len(seed)
+            except Exception as exc:
+                logger.debug("could not seed todos from plan: %s", exc)
+        finally:
+            plan_mode.exit()
+        try:
+            from agent import audit_log
+            audit_log.write_event(
+                audit_log.EVENT_PLAN_MODE_EXIT,
+                session_id=str(getattr(self.agent, "session_id", "") or ""),
+                data={
+                    "task": plan_mode.task,
+                    "plan_path": str(plan_path) if plan_path else None,
+                    "steps_seeded": todos_seeded,
+                },
+            )
+        except Exception:
+            pass
+        if plan_path is not None:
+            print(f"  ✅ Plan saved: {plan_path}")
+        print(f"  ▶ Act Mode active — full toolset restored.")
+        if todos_seeded:
+            print(f"  📌 Seeded {todos_seeded} todo step(s) from the plan.")
+        # Prime the agent to start executing.
+        try:
+            self._pending_input.put(
+                "Plan Mode complete and approved. Execute the plan you just "
+                "wrote — tick off each step in the todo list as you go, and "
+                "run the Verification commands when done."
+            )
+        except Exception:
+            pass
+
+    def _handle_cancel_plan_command(self) -> None:
+        """Abort Plan Mode without persisting the artifact.
+
+        Useful when the agent went down the wrong investigative path
+        and you want to start fresh with a different /plan.  The
+        partial artifact file (if any) is deleted; the in-memory
+        PlanModeState is reset.
+        """
+        if not hasattr(self, "agent") or not self.agent:
+            print("  No active agent session.")
+            return
+        plan_mode = getattr(self.agent, "_plan_mode", None)
+        if plan_mode is None or not plan_mode.enabled:
+            print("  Not currently in Plan Mode.")
+            return
+        path = plan_mode.plan_path
+        plan_mode.reset()
+        # Best-effort: remove a stale partial file if it exists.
+        if path is not None and path.exists():
+            try:
+                path.unlink()
+                print(f"  ✗ Plan Mode cancelled — removed partial artifact at {path}")
+            except OSError as exc:
+                print(f"  ✗ Plan Mode cancelled — could not remove {path}: {exc}")
+        else:
+            print("  ✗ Plan Mode cancelled.")
+        print("  ▶ Full toolset restored.")
+
+    def _handle_plan_show_command(self) -> None:
+        """Display the current Plan Mode plan artifact (or last one)."""
+        if not hasattr(self, "agent") or not self.agent:
+            print("  No active agent session.")
+            return
+        plan_mode = getattr(self.agent, "_plan_mode", None)
+        if plan_mode is None or plan_mode.plan_path is None:
+            print("  No plan artifact for this session. Use /plan <task> to create one.")
+            return
+        path = plan_mode.plan_path
+        if not path.exists():
+            print(f"  Plan path is set but file does not exist yet: {path}")
+            return
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            print(f"  Could not read plan: {exc}")
+            return
+        print(f"  📋 {path}")
+        print()
+        print(text)
+
+    def _handle_hooks_command(self, command: str) -> None:
+        """List, reload, or trust user-defined lifecycle hooks.
+
+        Syntax:
+            /hooks            — list active hooks for this session
+            /hooks reload     — force-reload the registry from disk
+            /hooks trust      — trust the project's .hermes/hooks.json
+        """
+        if not hasattr(self, "agent") or not self.agent:
+            print("  No active agent session.")
+            return
+        parts = command.split(None, 1)
+        sub = (parts[1].strip().lower() if len(parts) > 1 else "")
+
+        if sub == "reload":
+            try:
+                self.agent._hook_registry = None
+                self.agent._hook_registry_loaded = False
+                registry = self.agent._get_hook_registry()
+                print(f"  ↻ Reloaded — {len(registry) if registry else 0} hook(s) active.")
+            except Exception as exc:
+                print(f"  Reload failed: {exc}")
+            return
+
+        if sub == "trust":
+            try:
+                from agent.hooks import _find_project_hooks_file, trust_path
+                from pathlib import Path as _P
+                hooks_file = _find_project_hooks_file(_P(os.getcwd()))
+                if hooks_file is None:
+                    print("  No project hooks file (.hermes/hooks.json) found from cwd.")
+                    return
+                trust_path(hooks_file)
+                print(f"  ✅ Trusted: {hooks_file}")
+                print("  Run /hooks reload to apply.")
+            except Exception as exc:
+                print(f"  Trust failed: {exc}")
+            return
+
+        # Default: list.
+        try:
+            registry = self.agent._get_hook_registry()
+        except Exception as exc:
+            print(f"  Could not load hook registry: {exc}")
+            return
+        if registry is None or len(registry) == 0:
+            print("  No user-defined hooks loaded.")
+            print("  Drop ~/.hermes/hooks.json or .hermes/hooks.json in your repo.")
+            return
+        report = getattr(self.agent, "_hook_load_report", None)
+        if report is not None:
+            for warn in report.warnings():
+                print(f"  ⚠ {warn}")
+        print(f"  {len(registry)} hook(s) loaded:")
+        for entry in registry.describe():
+            print(f"    {entry['event']:<18} matcher={entry['matcher']:<15} "
+                  f"timeout={entry['timeout']:>3}s  source={entry['source']:<7} "
+                  f"cmd={entry['command']}")
+
+    def _handle_verify_command(self) -> None:
+        """Manually trigger a verification pass on the most recent assistant
+        response.  Useful when verification is disabled in config but you
+        want a one-off sanity check.
+        """
+        if not hasattr(self, "agent") or not self.agent:
+            print("  No active agent session.")
+            return
+        latest_response = ""
+        try:
+            for msg in reversed(self.conversation_history or []):
+                if msg.get("role") == "assistant":
+                    latest_response = (msg.get("content") or "").strip()
+                    if latest_response:
+                        break
+        except Exception:
+            pass
+        if not latest_response:
+            print("  No assistant response yet to verify.")
+            return
+        try:
+            from agent.verification import render_summary_for_user
+            report = self.agent._run_verifier(final_response=latest_response)
+            if report is None:
+                # _run_verifier returns None when disabled and no plan
+                # artifact — for /verify we force it on by temporarily
+                # injecting a config-style flag.
+                print("  Verification is not configured and no plan exists. "
+                      "Set verification.enabled: true in config.yaml or "
+                      "run /plan first.")
+                return
+            print(f"  {render_summary_for_user(report)}")
+            if report.issues:
+                from agent.verification import render_rework_message
+                print()
+                print(render_rework_message(report,
+                                            getattr(self.agent._plan_mode, "plan_path", None)))
+        except Exception as exc:
+            print(f"  Verification failed: {exc}")
+
+    def _maybe_surface_promotion_nudge(self) -> None:
+        """Check the promotion engine; if there's a new candidate, nudge.
+
+        Called after a fresh lesson lands (rework→VERIFIED).  Stays
+        silent unless a NEW pattern crosses the threshold this turn —
+        we track the last-seen candidate count on the CLI instance so
+        the nudge fires exactly once per emerging pattern.
+        """
+        try:
+            from agent import skill_promotion as _sp
+            candidates = _sp.find_skill_candidates()
+            candidates = _sp.filter_already_installed(candidates)
+            n = len(candidates)
+            prior = getattr(self, "_last_promotion_candidate_count", 0)
+            if n > prior:
+                # New pattern emerged this turn — nudge once.
+                self._last_promotion_candidate_count = n
+                # Show only the newly-strongest one to avoid noise.
+                top = candidates[0] if candidates else None
+                if top is not None:
+                    print(f"  🌱 New skill candidate ready: `{top.name}` "
+                          f"(score={top.score:.1f}, "
+                          f"tags={','.join(top.shared_tags[:3])})")
+                    print(f"  Run /promotions to review, "
+                          f"/promotions install {top.name} to adopt.")
+            else:
+                self._last_promotion_candidate_count = n
+        except Exception as exc:
+            logger.debug("promotion nudge failed: %s", exc)
+
+    def _handle_promotions_command(self, command: str) -> None:
+        """Review auto-promotion candidates from clustered lessons.
+
+        Syntax:
+            /promotions               — list candidates (no install)
+            /promotions list          — alias of bare /promotions
+            /promotions install <name>
+                                      — install a single candidate by name
+            /promotions install-all   — install every candidate (skips
+                                        any whose target already exists)
+        """
+        from agent import skill_promotion as _sp
+        parts = command.split(None, 2)
+        sub = (parts[1].strip().lower() if len(parts) > 1 else "list")
+
+        # Skill candidates from clustered lessons.
+        candidates = _sp.find_skill_candidates()
+        # Profile candidates from heavy skill usage.  Read the existing
+        # skill_usage tracker that's already in production — every skill
+        # invocation increments use_count there.
+        try:
+            from tools.skill_usage import load_usage as _load_usage
+            usage_data = _load_usage() or {}
+            usage_counts = {
+                name: int(rec.get("use_count") or 0)
+                for name, rec in usage_data.items()
+            }
+            profile_candidates = _sp.find_profile_candidates_from_usage(
+                usage_counts,
+            )
+            candidates.extend(profile_candidates)
+        except Exception as exc:
+            logger.debug("profile-candidate lookup failed: %s", exc)
+        candidates = _sp.filter_already_installed(candidates)
+
+        if not candidates:
+            print("  📦 No promotion candidates yet.")
+            print("  Skills are auto-proposed when ≥ 3 lessons share ≥ 2 tags.")
+            print("  Build up the corpus by letting the verifier catch reworks.")
+            return
+
+        if sub in ("list", ""):
+            print(f"  📦 {len(candidates)} promotion candidate(s):")
+            for c in candidates:
+                tags = ",".join(c.shared_tags[:5])
+                print(f"    {c.name:<32}  score={c.score:5.1f}  "
+                      f"tags={tags}")
+                print(f"      ↳ {c.description}")
+            print()
+            print("  Install one: /promotions install <name>")
+            print("  Install all: /promotions install-all")
+            return
+
+        if sub == "install-all":
+            installed: list = []
+            for c in candidates:
+                try:
+                    path = _sp.install_candidate(c)
+                    installed.append((c.name, path))
+                except Exception as exc:
+                    print(f"  ❌ {c.name}: install failed — {exc}")
+            print(f"  ✅ Installed {len(installed)} candidate(s):")
+            for name, path in installed:
+                print(f"    {name}  →  {path}")
+            return
+
+        if sub == "install":
+            target_name = parts[2].strip() if len(parts) > 2 else ""
+            if not target_name:
+                print("  Usage: /promotions install <name>")
+                return
+            match = next((c for c in candidates if c.name == target_name), None)
+            if match is None:
+                available = ", ".join(c.name for c in candidates[:10])
+                print(f"  No candidate named {target_name!r}. Available: {available}")
+                return
+            try:
+                path = _sp.install_candidate(match)
+                print(f"  ✅ Installed {match.name}  →  {path}")
+            except Exception as exc:
+                print(f"  ❌ Install failed: {exc}")
+            return
+
+        print(f"  Unknown subcommand: {sub!r}. Use list / install / install-all.")
+
+    def _handle_lessons_command(self, command: str) -> None:
+        """Browse lessons learned from past verifier rework cycles.
+
+        Syntax:
+            /lessons               — show 5 most recent lessons
+            /lessons <query>       — search by relevance to query
+            /lessons count         — show total lesson count + dir path
+            /lessons show <name>   — show one lesson's full body
+        """
+        from agent import lessons as _lessons
+        parts = command.split(None, 2)
+        sub = (parts[1].strip().lower() if len(parts) > 1 else "")
+
+        if sub == "count":
+            all_l = _lessons.all_lessons()
+            print(f"  📚 {len(all_l)} lesson(s) in {_lessons._lessons_dir()}")
+            return
+
+        if sub == "show":
+            name = parts[2].strip() if len(parts) > 2 else ""
+            if not name:
+                print("  Usage: /lessons show <filename-stem>")
+                return
+            target_dir = _lessons._lessons_dir()
+            match = None
+            for path in target_dir.glob("*.md"):
+                if name in path.stem:
+                    match = path
+                    break
+            if match is None:
+                print(f"  No lesson matching {name!r}.")
+                return
+            print(f"  📁 {match}")
+            print()
+            print(match.read_text(encoding="utf-8"))
+            return
+
+        if sub:
+            # Treat the rest as a search query.
+            query = command.split(None, 1)[1].strip()
+            results = _lessons.relevant_lessons(query, limit=10)
+            if not results:
+                print(f"  No lessons matching {query!r}.")
+                return
+            print(f"  📚 {len(results)} relevant lesson(s) for {query!r}:")
+            for lesson in results:
+                tags = ",".join(lesson.tags[:4])
+                print(f"    {lesson.task[:60]:<60}  [{tags}]")
+            return
+
+        # Default: 5 most recent.
+        all_l = _lessons.all_lessons()
+        if not all_l:
+            print(f"  📚 No lessons yet — corpus lives in {_lessons._lessons_dir()}.")
+            print("  Lessons are captured automatically when the verifier")
+            print("  surfaces NEEDS_REWORK and a later attempt succeeds.")
+            return
+        recent = sorted(all_l, key=lambda l: -l.created_at)[:5]
+        print(f"  📚 {len(all_l)} lesson(s) total — showing 5 most recent:")
+        for lesson in recent:
+            import time as _t
+            ts = _t.strftime("%Y-%m-%d", _t.localtime(lesson.created_at))
+            tags = ",".join(lesson.tags[:4])
+            print(f"    {ts}  {lesson.task[:60]:<60}  [{tags}]")
+
+    def _handle_audit_command(self, command: str) -> None:
+        """Inspect the structured audit log of lifecycle events.
+
+        Syntax:
+            /audit                — show last 20 events
+            /audit tail [N]       — show last N events (default 20)
+            /audit summary        — count by event type
+            /audit path           — print the resolved log path
+        """
+        from agent import audit_log
+        parts = command.split(None, 2)
+        sub = (parts[1].strip().lower() if len(parts) > 1 else "tail")
+
+        if sub == "path":
+            print(f"  📁 {audit_log._resolve_log_path()}")
+            cfg = audit_log._audit_config()
+            print(f"  enabled: {cfg.get('enabled', False)}")
+            return
+
+        if sub == "verify":
+            # Tamper-evidence check: walk the prev_hash chain and (if
+            # an HMAC key is configured) verify every line's signature.
+            result = audit_log.verify_chain()
+            if result.ok:
+                print(f"  ✅ Chain intact — {result.lines_ok}/{result.lines_total} line(s) verified.")
+                if result.sig_checked:
+                    print(f"  🔐 HMAC: {result.sig_ok} signed, "
+                          f"{result.sig_missing} unsigned.")
+                else:
+                    print("  ℹ Chain only (no HMAC key configured). "
+                          "Set HERMES_AUDIT_HMAC_KEY for cryptographic signing.")
+            else:
+                print(f"  ❌ Chain broken — {result.failure_reason}")
+                if result.first_bad_line is not None:
+                    print(f"     First bad line: {result.first_bad_line}")
+                print(f"     Lines verified before break: {result.lines_ok}")
+            return
+
+        if sub == "summary":
+            counts = audit_log.count_events_by_type()
+            if not counts:
+                print("  No audit events recorded.")
+                print(f"  Enable with audit.enabled: true in ~/.hermes/config.yaml.")
+                return
+            total = sum(counts.values())
+            print(f"  📊 {total} audit event(s):")
+            for event, count in sorted(counts.items(), key=lambda kv: -kv[1]):
+                bar = "█" * min(40, count)
+                print(f"    {event:<24} {count:>5}  {bar}")
+            return
+
+        # Default: tail.  Accept both `/audit 50` and `/audit tail 50`.
+        # Prior parsing relied on except-ValueError catching what was
+        # actually an IndexError, silently falling through to n=20.
+        n = 20
+        if sub.isdigit():
+            # `/audit 50` — the digit lives in parts[1].
+            try:
+                n = max(1, int(parts[1]))
+            except (ValueError, IndexError):
+                n = 20
+        elif sub == "tail" and len(parts) > 2:
+            try:
+                n = max(1, int(parts[2]))
+            except (ValueError, IndexError):
+                n = 20
+        events = audit_log.tail_events(n=n)
+        if not events:
+            print("  No audit events recorded.")
+            print(f"  Enable with audit.enabled: true in ~/.hermes/config.yaml.")
+            print(f"  Log path: {audit_log._resolve_log_path()}")
+            return
+        print(f"  📋 Last {len(events)} audit event(s):")
+        for e in events:
+            ts = (e.get("ts") or "")[:19].replace("T", " ")
+            session = (e.get("session_id") or "")[:12]
+            event = e.get("event") or "<unknown>"
+            data = e.get("data") or {}
+            # Compact one-line summary of the data dict
+            data_preview = ", ".join(
+                f"{k}={str(v)[:24]}" for k, v in list(data.items())[:3]
+            )
+            if len(data) > 3:
+                data_preview += f", +{len(data)-3} more"
+            print(f"    {ts}  [{session:>12}]  {event:<20}  {data_preview}")
+
+    def _handle_subagents_command(self, command: str) -> None:
+        """List, reload, or inspect named subagent profiles.
+
+        Syntax:
+            /subagents              — list all available profiles
+            /subagents reload       — force re-read of profile files from disk
+            /subagents show <name>  — show one profile's full body
+        """
+        if not hasattr(self, "agent") or not self.agent:
+            print("  No active agent session.")
+            return
+        parts = command.split(None, 2)
+        sub = (parts[1].strip().lower() if len(parts) > 1 else "")
+
+        if sub == "reload":
+            try:
+                self.agent._subagent_profile_registry = None
+                from tools.delegate_tool import _get_subagent_profile_registry
+                registry = _get_subagent_profile_registry(self.agent)
+                print(f"  ↻ Reloaded — {len(registry)} subagent profile(s) active.")
+            except Exception as exc:
+                print(f"  Reload failed: {exc}")
+            return
+
+        try:
+            from tools.delegate_tool import _get_subagent_profile_registry
+            registry = _get_subagent_profile_registry(self.agent)
+        except Exception as exc:
+            print(f"  Could not load profile registry: {exc}")
+            return
+
+        if sub == "show":
+            name = parts[2].strip() if len(parts) > 2 else ""
+            if not name:
+                print("  Usage: /subagents show <name>")
+                return
+            profile = registry.get(name)
+            if profile is None:
+                available = ", ".join(registry.names()) or "(none)"
+                print(f"  No profile named {name!r}. Available: {available}")
+                return
+            print(f"  📁 {profile.source_path or '<inline>'}  [{profile.source}]")
+            print(f"  name: {profile.name}")
+            if profile.description:
+                print(f"  description: {profile.description}")
+            if profile.toolsets:
+                print(f"  toolsets: {', '.join(profile.toolsets)}")
+            if profile.model:
+                print(f"  model: {profile.model}")
+            if profile.max_iterations:
+                print(f"  max_iterations: {profile.max_iterations}")
+            print()
+            print(profile.system_prompt)
+            return
+
+        # Default: list.
+        if len(registry) == 0:
+            print("  No subagent profiles loaded.")
+            print("  Drop ~/.hermes/agents/<name>.md or .hermes/agents/<name>.md "
+                  "in your repo.")
+            print("  Example body: ./website/docs/user-guide/features/subagents.md")
+            return
+        print(f"  {len(registry)} subagent profile(s) loaded:")
+        for entry in registry.describe():
+            src = entry["source"]
+            tools = ",".join(entry["toolsets"]) if entry["toolsets"] else "all"
+            model = entry["model"] or "inherit"
+            desc = entry["description"] or "(no description)"
+            print(f"    {entry['name']:<24}  [{src}]  tools={tools:<20}  "
+                  f"model={model}")
+            print(f"      {desc[:120]}")
 
     def _handle_snapshot_command(self, command: str):
         """Handle /snapshot — lightweight state snapshots for Hermes config/state.
@@ -7555,6 +8195,26 @@ class HermesCLI:
                 print(f"Plugin system error: {e}")
         elif canonical == "rollback":
             self._handle_rollback_command(cmd_original)
+        elif canonical == "plan":
+            self._handle_plan_command(cmd_original)
+        elif canonical == "exit-plan":
+            self._handle_exit_plan_command()
+        elif canonical == "cancel-plan":
+            self._handle_cancel_plan_command()
+        elif canonical == "plan-show":
+            self._handle_plan_show_command()
+        elif canonical == "hooks":
+            self._handle_hooks_command(cmd_original)
+        elif canonical == "verify":
+            self._handle_verify_command()
+        elif canonical == "subagents":
+            self._handle_subagents_command(cmd_original)
+        elif canonical == "audit":
+            self._handle_audit_command(cmd_original)
+        elif canonical == "lessons":
+            self._handle_lessons_command(cmd_original)
+        elif canonical == "promotions":
+            self._handle_promotions_command(cmd_original)
         elif canonical == "snapshot":
             self._handle_snapshot_command(cmd_original)
         elif canonical == "stop":
@@ -10629,6 +11289,100 @@ class HermesCLI:
             # Get the final response
             response = result.get("final_response", "") if result else ""
 
+            # Auto-rework: when the verifier surfaced a NEEDS_REWORK
+            # report, queue the rework message so the next turn picks it
+            # up automatically.  Capped per user-initiated task so a
+            # stuck verifier can't loop forever — the user can always
+            # /stop or ctrl+C, and the next genuine user message will
+            # arrive ahead of any further auto-queued rework.
+            if isinstance(result, dict) and result.get("rework_message"):
+                try:
+                    cfg = self.agent._verification_config()
+                    max_attempts = int(cfg.get("max_attempts", 2))
+                except Exception:
+                    max_attempts = 2
+                _rework_count = getattr(self, "_verification_rework_count", 0)
+                if _rework_count < max_attempts:
+                    self._verification_rework_count = _rework_count + 1
+                    # On the FIRST rework, remember enough to capture
+                    # a lesson if the agent later achieves VERIFIED.
+                    if _rework_count == 0:
+                        self._lessons_capture_buffer = {
+                            "task": message[:200] if isinstance(message, str) else "",
+                            "initial_response": (response or "")[:1500],
+                            "rework_summary": ((result.get("verification") or {})
+                                               .get("summary") or "")[:500],
+                        }
+                    print(f"  🔁 Verifier requested rework "
+                          f"(attempt {self._verification_rework_count}/{max_attempts})")
+                    try:
+                        from agent import audit_log
+                        audit_log.write_event(
+                            audit_log.EVENT_REWORK_INJECTED,
+                            session_id=str(getattr(self.agent, "session_id", "") or ""),
+                            data={
+                                "attempt": self._verification_rework_count,
+                                "max_attempts": max_attempts,
+                                "reason": (result.get("verification", {}) or {}).get("summary", ""),
+                            },
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        self._pending_input.put(result["rework_message"])
+                    except Exception as exc:
+                        logger.debug("could not queue rework message: %s", exc)
+                else:
+                    print(f"  ⚠ Verifier still unsatisfied after "
+                          f"{max_attempts} rework attempt(s) — surfacing the "
+                          f"original response.")
+                    self._verification_rework_count = 0
+            elif isinstance(result, dict) and result.get("verification"):
+                # VERIFIED — reset the counter for the next task.  If
+                # the task went through at least one rework cycle to get
+                # here, capture the delta as a lesson the agent can use
+                # next time.  Best-effort: never propagate failures.
+                if (result.get("verification", {}) or {}).get("status") == "VERIFIED":
+                    # Clear the executing_plan flag set by /exit-plan so
+                    # subsequent unrelated chat turns don't keep paying
+                    # for verifier LLM calls.  The plan executed
+                    # successfully; the auto_when_plan window closes.
+                    try:
+                        _pm = getattr(self.agent, "_plan_mode", None)
+                        if _pm is not None and getattr(_pm, "executing_plan", False):
+                            _pm.executing_plan = False
+                    except Exception:
+                        pass
+                    prior_count = self._verification_rework_count
+                    if prior_count > 0 and self._lessons_capture_buffer:
+                        try:
+                            from agent import lessons as _lessons
+                            buf = self._lessons_capture_buffer
+                            # Guard the default — message may be None
+                            # on non-interactive code paths; eager
+                            # subscript would crash before .get returns
+                            # the stored task.
+                            _fallback_task = (message[:120]
+                                              if isinstance(message, str)
+                                              else "")
+                            _lessons.capture_from_rework(
+                                task=buf.get("task") or _fallback_task,
+                                initial_response=buf.get("initial_response", ""),
+                                needs_rework_summary=buf.get("rework_summary", ""),
+                                final_response=response,
+                                session_id=str(getattr(self.agent, "session_id", "") or ""),
+                            )
+                            # Moat 10x: after a fresh lesson lands, check
+                            # whether the corpus has accumulated enough
+                            # clustered evidence to propose a new skill.
+                            # We don't install — we surface as a one-line
+                            # nudge.  User runs /promotions to confirm.
+                            self._maybe_surface_promotion_nudge()
+                        except Exception as exc:
+                            logger.debug("could not capture lesson: %s", exc)
+                self._verification_rework_count = 0
+                self._lessons_capture_buffer = None
+
             # Auto-generate session title after first exchange (non-blocking)
             if response and result and not result.get("failed") and not result.get("partial"):
                 try:
@@ -10950,6 +11704,16 @@ class HermesCLI:
             return _state_fragment("class:prompt-working", "⚕")
         if self._voice_mode:
             return _state_fragment("class:voice-prompt", "🎤")
+
+        # Plan Mode indicator — visible at the resting prompt so users
+        # never forget they're in read-only mode.  Transient state
+        # symbols above (voice, sudo, approval, clarify, agent-running)
+        # take precedence to avoid prompt clutter.
+        plan_mode = getattr(getattr(self, "agent", None), "_plan_mode", None)
+        if plan_mode is not None and plan_mode.enabled:
+            return [("class:prompt-working", "📋 "),
+                    ("class:prompt", symbol)]
+
         return [("class:prompt", symbol)]
 
     def _get_tui_prompt_text(self) -> str:

@@ -139,6 +139,86 @@ while (api_call_count < self.max_iterations and self.iteration_budget.remaining 
 Messages follow OpenAI format: `{"role": "system/user/assistant/tool", ...}`.
 Reasoning content is stored in `assistant_msg["reasoning"]`.
 
+### Lifecycle Extension Points
+
+Three categories of harness-level hooks fire around the agent loop. Pick
+the one that matches your need:
+
+| Extension point | Where it fires | Use case |
+|---|---|---|
+| **User-defined hooks** (`agent/hooks.py`, `~/.hermes/hooks.json` / `.hermes/hooks.json`) | `SessionStart` / `UserPromptSubmit` / `PreToolUse` / `PostToolUse` / `Stop` / `SubagentStop` / `SessionEnd` | Shell commands a user drops in to gate or augment behaviour. Claude-Code-style stdin-JSON + exit-code contract. Project-level config is trust-on-first-use (sha256-pinned). |
+| **Shell hooks** (`agent/shell_hooks.py`, `hooks:` block in `config.yaml`) | `pre_tool_call` / `post_tool_call` / `pre_llm_call` / `post_llm_call` / `on_session_*` / `subagent_stop` / etc. | The original Hermes shell-hook system. Wired through the plugin manager so Python plugins and shell hooks coexist. Allowlist consent on first use. |
+| **Python plugin hooks** (`hermes_cli/plugins.py`, `ctx.register_hook()` in a plugin) | Same events as shell hooks | Programmatic hooks for plugins (metrics, guardrails, transformation). Block decisions from Python plugins win ties over shell-hook blocks. |
+
+`AIAgent._fire_hook(event, **payload)` dispatches the first category;
+the second and third flow through `hermes_cli.plugins.invoke_hook(name, ...)`.
+
+Two new events (`UserPromptSubmit`, `Stop`) exist only in the first
+category — they have no equivalent in the older systems. Five overlap
+(`PreToolUse` ↔ `pre_tool_call`, `PostToolUse` ↔ `post_tool_call`,
+`SessionStart` ↔ `on_session_start`, `SessionEnd` ↔ `on_session_end`,
+`SubagentStop` ↔ `subagent_stop`); unifying the dispatch is a planned
+follow-up.
+
+### Plan Mode (`agent/plan_mode.py`)
+
+`AIAgent._plan_mode` is a `PlanModeState` instance. While
+`plan_mode.enabled` is True, `AIAgent._invoke_tool` refuses any tool not
+on the read-only allowlist via `plan_mode.is_tool_allowed(name, args)`.
+`/plan <task>` and `/exit-plan` are the user-facing toggles
+(`hermes_cli/commands.py` + `cli.py:_handle_plan_command`). The plan
+artifact persists at `.hermes/plans/<slug>-<ts>.md` and seeds the
+in-memory todo store on `/exit-plan` so progress is visible.
+
+### Named Subagent Profiles (`agent/subagent_profiles.py`)
+
+Profiles live as markdown-with-YAML-frontmatter files under
+`~/.hermes/agents/` (user) and `<cwd>/.hermes/agents/` (project; project
+beats user when names collide). `discover_profiles()` builds a
+`SubagentProfileRegistry` lazily on the parent agent the first time
+`delegate_task` runs in a session; subsequent calls hit the cache.
+
+`tools/delegate_tool.delegate_task` accepts a `subagent_type` parameter
+(top-level or per-task in batch mode). When set, the profile's body is
+prepended to the task's `context` (separated by `---`) and its
+`toolsets` whitelist is applied when the task hasn't set its own.
+Unknown profile names return a clear error listing the registry.
+
+`/subagents` and `/profiles` slash commands list, reload, or show
+individual profiles. Future work: thread `model` / `max_iterations` /
+`max_tokens` / `permission_mode` overrides from the frontmatter
+through `_build_child_agent`'s credential-resolution path.
+
+### Lessons Learned (`agent/lessons.py`)
+
+The compounding-intelligence layer.  When the CLI's auto-rework loop
+(`cli.py:_handle_response`) converges on `VERIFIED` after at least one
+`NEEDS_REWORK` cycle, `capture_from_rework()` writes a markdown
+lesson to `~/.hermes/lessons/<slug>-<ts>.md` containing task,
+initial approach, what went wrong, and what worked.
+
+At the start of every subsequent session, `AIAgent.run_conversation()`
+gates on `self._lessons_preamble_injected` (one-shot per agent):
+`relevant_lessons(user_message)` scores all lessons by fuzzy tag +
+text overlap (no embeddings), and the top 3 are prepended as a
+`<lessons-learned>` preamble inside the user message.
+
+The scoring filters zero-overlap matches entirely — recency boost
+only applies when there's other signal, so a fresh unrelated lesson
+doesn't displace real context.  `/lessons` slash command for
+browsing.
+
+### Self-Verification (`agent/verification.py`)
+
+`AIAgent._run_verifier()` spawns a verifier model call (through the
+mockable `_call_verifier_llm` seam) that reads the plan + git diff +
+`Stop`-hook output and emits a strict JSON verdict.
+`result["verification"]` and `result["rework_message"]` surface in the
+`run_conversation` return value when verification is enabled (or a Plan
+Mode artifact exists with `verification.auto_when_plan = true`).
+Callers (CLI, gateway, batch_runner) decide whether to re-enter the
+loop with `rework_message` as the next user turn.
+
 ---
 
 ## CLI Architecture (cli.py)

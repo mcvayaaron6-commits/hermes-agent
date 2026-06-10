@@ -1895,6 +1895,57 @@ def _recover_tasks_from_json_string(
     return parsed, None
 
 
+def _get_subagent_profile_registry(parent_agent):
+    """Lazy-load and cache the subagent profile registry on the parent agent.
+
+    The registry is discovered on first use using the cwd at that moment
+    and cached as an attribute on the agent so subsequent delegations
+    in the same session don't re-read the disk.  If the process changes
+    its cwd mid-session, the cache will not pick up profiles from the
+    new cwd until you call ``/subagents reload`` (or set
+    ``parent_agent._subagent_profile_registry = None``).
+
+    Reads ``subagents.allow_project_profiles`` from config.yaml.  When
+    False, project-level profiles from ``.hermes/agents/`` are skipped
+    entirely — useful when operating against untrusted repos.
+    """
+    cached = getattr(parent_agent, "_subagent_profile_registry", None)
+    if cached is not None:
+        return cached
+    try:
+        from hermes_cli.config import load_config
+        cfg = (load_config().get("subagents") or {})
+        allow_project = bool(cfg.get("allow_project_profiles", True))
+    except Exception:
+        allow_project = True
+
+    # Bundled starter profiles (Explore, code-reviewer, test-writer)
+    # live next to the Hermes source so users get a useful registry
+    # out of the box without copy-pasting from the docs.  User-level
+    # profiles in ~/.hermes/agents/ override these (higher precedence
+    # source rank); project-level profiles in .hermes/agents/ override
+    # both unless allow_project_profiles is false.
+    from pathlib import Path as _P
+    bundled_dir = _P(__file__).resolve().parent.parent / "agents_bundled"
+    builtin_dirs = [bundled_dir] if bundled_dir.is_dir() else []
+
+    try:
+        from agent.subagent_profiles import discover_profiles
+        registry = discover_profiles(
+            builtin_dirs=builtin_dirs,
+            allow_project_profiles=allow_project,
+        )
+    except Exception as exc:
+        logger.debug("subagent profile discovery failed: %s", exc)
+        from agent.subagent_profiles import SubagentProfileRegistry
+        registry = SubagentProfileRegistry()
+    try:
+        parent_agent._subagent_profile_registry = registry
+    except Exception:
+        pass
+    return registry
+
+
 def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
@@ -1904,6 +1955,7 @@ def delegate_task(
     acp_command: Optional[str] = None,
     acp_args: Optional[List[str]] = None,
     role: Optional[str] = None,
+    subagent_type: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -2013,6 +2065,53 @@ def delegate_task(
             )
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+
+    # Subagent profile lookup — when subagent_type is set (or any
+    # individual task overrides it via t["subagent_type"]), look up
+    # the named profile and merge its system prompt + toolsets into
+    # the task's context.  Per-task fields explicitly set on the task
+    # win over profile defaults (least-surprise: a caller who wrote
+    # ``{"goal": "x", "toolsets": ["file"]}`` keeps the file-only
+    # toolset even if the profile would have widened it).
+    _profile_registry = _get_subagent_profile_registry(parent_agent)
+    for task in task_list:
+        st = task.get("subagent_type") or subagent_type
+        if not st:
+            continue
+        profile = _profile_registry.get(st)
+        if profile is None:
+            # Truncate the available-profiles list so a typo against a
+            # large registry doesn't waste the model's tool-output
+            # budget on a wall of names.
+            all_names = _profile_registry.names()
+            preview = all_names[:10]
+            shown = ", ".join(preview) or "(none)"
+            if len(all_names) > len(preview):
+                shown += f", and {len(all_names) - len(preview)} more"
+                shown += " — run /subagents to list all"
+            return tool_error(
+                f"Unknown subagent_type {st!r}. "
+                f"Available profiles: {shown}. "
+                f"Add one as ~/.hermes/agents/<name>.md."
+            )
+        # Prepend the profile's system prompt to the task's context.
+        # The profile body acts as persistent identity for this turn;
+        # the task's own context remains the per-call framing.  Use a
+        # collision-resistant boundary (a fenced section header) rather
+        # than bare --- so an existing context containing markdown
+        # horizontal rules doesn't blur the boundary.
+        existing_ctx = task.get("context") or ""
+        merged_ctx = profile.system_prompt.strip()
+        if existing_ctx.strip():
+            merged_ctx = (
+                f"{merged_ctx}\n\n"
+                f"=== TASK CONTEXT BELOW ===\n\n"
+                f"{existing_ctx}"
+            )
+        task["context"] = merged_ctx
+        # Apply toolset whitelist only when the task hasn't set one.
+        if not task.get("toolsets") and profile.toolsets:
+            task["toolsets"] = list(profile.toolsets)
 
     overall_start = time.monotonic()
     results = []
@@ -2702,6 +2801,14 @@ DELEGATE_TASK_SCHEMA = {
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
+                        "subagent_type": {
+                            "type": "string",
+                            "description": (
+                                "Per-task subagent profile override. See top-level "
+                                "'subagent_type' for semantics. The profile's system "
+                                "prompt and toolset whitelist apply to this task only."
+                            ),
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -2714,6 +2821,18 @@ DELEGATE_TASK_SCHEMA = {
                 "type": "string",
                 "enum": ["leaf", "orchestrator"],
                 "description": "(rebuilt at get_definitions() time)",
+            },
+            "subagent_type": {
+                "type": "string",
+                "description": (
+                    "Named subagent profile to apply (e.g. 'code-reviewer', "
+                    "'security-auditor', 'Explore'). Looks up the profile in "
+                    "~/.hermes/agents/<name>.md or .hermes/agents/<name>.md and "
+                    "applies its system prompt + toolset whitelist to every spawned "
+                    "child. Per-task subagent_type beats this top-level value. "
+                    "Returns a clear error listing available profiles if the name is "
+                    "unknown. Use /agents in the CLI to list."
+                ),
             },
             "acp_command": {
                 "type": "string",

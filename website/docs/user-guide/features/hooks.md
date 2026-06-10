@@ -853,6 +853,78 @@ With heavy delegation (e.g. orchestrator roles × 5 leaves × nested depth), `su
 
 ---
 
+### `user_prompt_submit`
+
+Fires **once per user turn**, BEFORE the user message is appended to the transcript or sent to the model. This is the first hook the harness fires after a user types a prompt (or sends one over a messaging platform), so it's the natural place to gate input — block prompts that violate policy, redact PII before the model sees them, or contribute context that gets prepended.
+
+```yaml
+hooks:
+  user_prompt_submit:
+    - command: ~/.hermes/agent-hooks/redact-pii.sh
+```
+
+**Kwargs passed to your hook:** `user_message: str`, `session_id: str`.
+
+**To block:** return JSON `{"action": "block", "message": "..."}` (Hermes-canonical) or `{"decision": "block", "reason": "..."}` (Claude-Code-style). The agent returns a synthetic `[Blocked by hook]` response and the prompt never reaches the model.
+
+**To inject context:** return `{"additional_context": "..."}`. The string is prepended inside a `<hook-context>` envelope so the model can see it but it's visually distinct from the user's message.
+
+Also exposed under the [`UserPromptSubmit` event name](#user-defined-hooks-json-config) for the JSON config style.
+
+---
+
+### `stop`
+
+Fires when the agent emits a **final non-tool response**, before it reaches the user. This is the canonical "is the agent really done?" gate. The output you contribute via `additional_context` is fed directly to the [self-verification](./verification) subagent as `test_output` — making "Stop hook runs `pytest`, verifier reads the result, agent fixes failures" a one-config-line pattern.
+
+```yaml
+hooks:
+  stop:
+    - command: pytest -q --tb=line
+      timeout: 120
+```
+
+**Kwargs passed to your hook:** `final_response: str`, `session_id: str`.
+
+**To block:** return JSON `{"action": "block", "message": "..."}`. The agent's response is not delivered; `result["stop_hook_block"]` is set so callers (CLI, gateway, batch_runner) can decide whether to re-enter the loop with the block reason as the next turn.
+
+**To gate verification with evidence:** return `{"additional_context": "<test output>"}`. The verifier sees the output and grades the agent's "done" claim against real evidence.
+
+Also exposed under the [`Stop` event name](#user-defined-hooks-json-config) for the JSON config style.
+
+---
+
+### User-defined hooks (JSON config)
+
+Hermes also supports a Claude-Code-compatible JSON config style for the same lifecycle events, with project-level overrides and sha256-pinned trust.  Either `~/.hermes/hooks.json` (user-global, implicitly trusted) or `.hermes/hooks.json` (per-repo, trust-on-first-use):
+
+```json
+{
+  "PreToolUse": [
+    {"matcher": "write_file", "command": "./scripts/secret-scan.sh"}
+  ],
+  "PostToolUse": [
+    {"matcher": "write_file|patch", "command": "ruff check --fix"}
+  ],
+  "Stop": [
+    {"command": "pytest -q --tb=line", "timeout": 120}
+  ]
+}
+```
+
+Event names are the Claude-Code-canonical CamelCase: `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`, `SubagentStop`, `SessionEnd`.
+
+Project-level files are trusted by:
+- Running `/hooks trust` from inside the agent
+- Adding the file's absolute path to `HERMES_TRUSTED_HOOK_FILES` (colon-separated, for CI)
+- Manually editing `~/.hermes/trusted_hook_files.json`
+
+Editing the file invalidates the trust — it must be re-trusted.  `/hooks reload` re-reads the registry after edits.  `/hooks` lists active hooks with their source (user / project) and matcher.
+
+Internally, both this JSON config and the YAML `hooks:` block route through the same dispatch (`AIAgent._fire_hook` → `hermes_cli.plugins.invoke_hook`), so a single project can mix both config styles freely.
+
+---
+
 ### `pre_gateway_dispatch`
 
 Fires **once per incoming `MessageEvent`** in the gateway, after the internal-event guard but **before** auth/pairing and agent dispatch. This is the interception point for gateway-level message-flow policies (listen-only windows, human handover, per-chat routing, etc.) that don't fit cleanly into any single platform adapter.

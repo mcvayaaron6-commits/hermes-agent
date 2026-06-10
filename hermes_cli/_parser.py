@@ -109,6 +109,48 @@ def build_top_level_parser():
             "auto-bypassed. Intended for scripts / pipes."
         ),
     )
+    parser.add_argument(
+        "--output-format",
+        choices=("text", "json"),
+        default="text",
+        help=(
+            "Output format for -z / --oneshot. 'text' (default) emits "
+            "just the final response. 'json' emits a structured envelope "
+            "with final_response, model, provider, token counts, "
+            "estimated cost, verification status (if applicable), and "
+            "rework_message. Use json in CI / scripts that need to gate "
+            "on verifier outcomes or read token budgets."
+        ),
+    )
+    parser.add_argument(
+        "--no-fail-on-rework",
+        dest="fail_on_rework",
+        action="store_false",
+        default=True,
+        help=(
+            "For -z --output-format json: do not exit non-zero when "
+            "verification.status == NEEDS_REWORK.  Default behaviour "
+            "gates CI on verification; use this flag when verification "
+            "is informational (e.g. you pipe the envelope into Slack "
+            "and don't want a build failure for every rework cycle)."
+        ),
+    )
+    parser.add_argument(
+        "--auto-rework",
+        dest="auto_rework",
+        action="store_true",
+        default=False,
+        help=(
+            "For -z headless mode: when the verifier surfaces "
+            "NEEDS_REWORK, automatically re-inject the rework_message "
+            "as the next user turn and run again, until VERIFIED (or "
+            "verification.max_attempts is hit).  Closes the autonomy "
+            "loop for CI / scripted pipelines without needing a human "
+            "to consume the JSON envelope between attempts.  The final "
+            "envelope reflects the last attempt's state and includes "
+            "rework_history with one entry per intermediate attempt."
+        ),
+    )
     # --model / --provider are accepted at the top level so they can pair
     # with -z without needing the `chat` subcommand.  If neither -z nor a
     # subcommand consumes them, they fall through harmlessly as None.
