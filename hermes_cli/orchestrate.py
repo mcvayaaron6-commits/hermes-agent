@@ -118,23 +118,36 @@ def _build_specs(raw_tasks: Any) -> List[Any]:
 
 
 def _build_parent_agent():
-    """Build a minimal AIAgent so the orchestrator's default executor
-    has someone to delegate from.  Uses ``oneshot``-style auto-resolution
-    of provider/model from config.
+    """Build an AIAgent that carries credentials so the orchestrator's
+    default executor can delegate.
+
+    We don't run a conversation; we just need a constructed AIAgent
+    for delegate_task() to thread credentials through.  Use
+    ``resolve_runtime_provider`` (same as oneshot.py) so config.yaml-
+    only deployments work — previously this built a bare AIAgent
+    with no api_key/base_url and child subagents failed to
+    authenticate.
     """
     # Import locally to keep CLI startup cheap.
-    from hermes_cli.oneshot import _run_agent  # noqa: F401 — sanity
     from run_agent import AIAgent
-    # We don't actually run a conversation here — we just need a
-    # constructed AIAgent for delegate_task() to thread credentials
-    # through.  The executor will call delegate_task itself.
     from hermes_cli.config import load_config
+    from hermes_cli.runtime_provider import resolve_runtime_provider
     cfg = load_config()
     model_cfg = (cfg.get("model") or {})
+    effective_model = model_cfg.get("default") or model_cfg.get("model")
+    runtime = resolve_runtime_provider(
+        requested=model_cfg.get("provider"),
+        target_model=effective_model or None,
+    )
     return AIAgent(
-        model=model_cfg.get("default") or model_cfg.get("model"),
-        provider=model_cfg.get("provider"),
+        api_key=runtime.get("api_key"),
+        base_url=runtime.get("base_url"),
+        provider=runtime.get("provider"),
+        api_mode=runtime.get("api_mode"),
+        model=effective_model,
+        credential_pool=runtime.get("credential_pool"),
         quiet_mode=True,
+        platform="cli",
     )
 
 

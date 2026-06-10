@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sys
 import time
 from pathlib import Path
@@ -85,9 +86,32 @@ Example output shape:
 """
 
 
+_FENCE_BLOCK_RE = re.compile(
+    r"```(?:yaml|yml)?\s*\n(?P<body>.*?)\n```",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
 def _strip_fences(text: str) -> str:
-    """Remove ``` fences if the model wrapped its YAML in them anyway."""
+    """Extract YAML content even when the model wraps it in fences.
+
+    Tolerant of:
+    * Plain text with no fences (returned unchanged).
+    * Single leading-and-trailing ``` fence (original behaviour).
+    * Prose before AND/OR after a fenced block — pulls the body out
+      via regex.  Common model failure mode is 'Here is the plan:\\n
+      ```yaml ... ```\\nLet me know.' which the prior implementation
+      mis-parsed as YAML.
+    """
     stripped = text.strip()
+    # Fast path — no fences anywhere.
+    if "```" not in stripped:
+        return stripped
+    # Try regex extraction first (handles prose + fence + prose).
+    match = _FENCE_BLOCK_RE.search(stripped)
+    if match is not None:
+        return match.group("body").strip()
+    # Fall back to the simple-strip path for fence-only output.
     if stripped.startswith("```"):
         nl = stripped.find("\n")
         if nl > 0:
@@ -235,16 +259,36 @@ def run_superagent(
 
     # ---------- Step 2: orchestrate ----------
     from tools.orchestrate_tool import orchestrate_tasks
-    # Build a minimal parent agent for the orchestrator's executor.
+    # Build a parent agent that actually carries credentials.  The
+    # prior implementation constructed AIAgent(model, provider,
+    # quiet_mode=True) with no api_key/base_url/api_mode/credential_pool
+    # — delegate_task then pulled effective_api_key=None and child
+    # subagents failed to authenticate when creds lived in
+    # config.yaml rather than env vars.  Mirror oneshot.py's
+    # resolve_runtime_provider path so credentials thread through.
     try:
         from run_agent import AIAgent
         from hermes_cli.config import load_config
+        from hermes_cli.runtime_provider import resolve_runtime_provider
         cfg = load_config()
         model_cfg = (cfg.get("model") or {})
+        effective_model = (model
+                           or model_cfg.get("default")
+                           or model_cfg.get("model"))
+        effective_provider = provider or model_cfg.get("provider")
+        runtime = resolve_runtime_provider(
+            requested=effective_provider,
+            target_model=effective_model or None,
+        )
         parent = AIAgent(
-            model=model or model_cfg.get("default") or model_cfg.get("model"),
-            provider=provider or model_cfg.get("provider"),
+            api_key=runtime.get("api_key"),
+            base_url=runtime.get("base_url"),
+            provider=runtime.get("provider"),
+            api_mode=runtime.get("api_mode"),
+            model=effective_model,
+            credential_pool=runtime.get("credential_pool"),
             quiet_mode=True,
+            platform="cli",
         )
     except Exception as exc:
         sys.stderr.write(

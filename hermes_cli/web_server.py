@@ -574,13 +574,20 @@ async def get_ready():
         components["config"] = {"ok": False, "error": str(exc)[:200]}
         overall_ok = False
 
-    # 2. Storage is writable.
+    # 2. Storage is writable — use a per-call unique probe path to
+    # avoid the race where two concurrent k8s probes both unlink the
+    # same file (one wins, the other gets FileNotFoundError and
+    # reports storage as failed on a perfectly healthy node).
     try:
         from hermes_constants import get_hermes_home
+        import os as _os
         home = get_hermes_home()
-        probe = home / ".readiness_probe"
+        probe = home / f".readiness_probe-{_os.getpid()}-{id(home)}"
         probe.write_text("ok", encoding="utf-8")
-        probe.unlink()
+        try:
+            probe.unlink()
+        except FileNotFoundError:
+            pass  # idempotent — already cleaned up by parallel probe
         components["storage"] = {"ok": True, "path": str(home)}
     except Exception as exc:
         components["storage"] = {"ok": False, "error": str(exc)[:200]}
@@ -591,14 +598,20 @@ async def get_ready():
         from agent import audit_log
         cfg = audit_log._audit_config()
         if cfg.get("enabled"):
-            # Only check whether the file path is reachable; full
-            # verify_chain() may scan a large log and is too slow
-            # for a per-probe call.  /audit verify is the manual
-            # equivalent.
+            # Readability probe — REPORT path status, never MUTATE.
+            # The prior implementation called path.parent.mkdir() on
+            # every probe; k8s polls /ready every few seconds, so a
+            # read-only mount surfaced PermissionError on every hit
+            # and a writeable mount got its directories repeatedly
+            # recreated.  Just observe.
             path = audit_log._resolve_log_path()
-            path.parent.mkdir(parents=True, exist_ok=True)
-            components["audit_log"] = {"ok": True, "path": str(path),
-                                       "enabled": True}
+            parent_exists = path.parent.exists()
+            components["audit_log"] = {
+                "ok": True,
+                "path": str(path),
+                "enabled": True,
+                "log_dir_exists": parent_exists,
+            }
         else:
             components["audit_log"] = {"ok": True, "enabled": False}
     except Exception as exc:
