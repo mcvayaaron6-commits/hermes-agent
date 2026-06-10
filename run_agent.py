@@ -5917,7 +5917,18 @@ class AIAgent:
         cfg = self._verification_config()
         plan_mode = getattr(self, "_plan_mode", None)
         plan_path_obj = None
-        if plan_mode is not None and plan_mode.plan_path is not None:
+        # auto_when_plan must fire while Plan Mode is active AND on
+        # the immediate execution turns after /exit-plan (when the
+        # captured plan is being acted on).  We use a transient
+        # ``executing_plan`` flag set by /exit-plan; it's cleared
+        # after the first VERIFIED so subsequent unrelated chat
+        # turns don't keep paying for verifier LLM calls.  Prior
+        # code triggered verification for the entire session because
+        # plan_path persisted indefinitely.
+        if plan_mode is not None and (
+            plan_mode.enabled
+            or getattr(plan_mode, "executing_plan", False)
+        ) and plan_mode.plan_path is not None:
             plan_path_obj = plan_mode.plan_path
         elif plan_path:
             from pathlib import Path as _P
@@ -10882,6 +10893,26 @@ class AIAgent:
             pass
         return result
 
+    def _dispatch_orchestrate_tasks(self, function_args: dict) -> str:
+        """Single call site for orchestrate_tasks dispatch.
+
+        The registry-routed path can't inject ``parent_agent`` (registry.dispatch
+        only threads ``task_id`` / ``user_task`` / ``enabled_tools``), so this
+        method is the explicit special-case that gives the orchestrator a
+        live AIAgent to delegate from — mirroring _dispatch_delegate_task.
+
+        Without this hook, ``orchestrate_tasks`` invoked from the agent loop
+        always returns ``{"error": "orchestrate_tasks requires a parent agent
+        context."}``, making the whole parallel-DAG feature dead from the
+        model's perspective.
+        """
+        from tools.orchestrate_tool import orchestrate_tasks as _orchestrate
+        return _orchestrate(
+            tasks=function_args.get("tasks") or [],
+            fanout=int(function_args.get("fanout") or 4),
+            parent_agent=self,
+        )
+
     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,
                      tool_call_id: Optional[str] = None, messages: list = None,
                      pre_tool_block_checked: bool = False) -> str:
@@ -11020,6 +11051,8 @@ class AIAgent:
             )
         elif function_name == "delegate_task":
             return self._dispatch_delegate_task(function_args)
+        elif function_name == "orchestrate_tasks":
+            return self._dispatch_orchestrate_tasks(function_args)
         else:
             return handle_function_call(
                 function_name, function_args, effective_task_id,
@@ -11600,7 +11633,47 @@ class AIAgent:
 
             tool_start_time = time.time()
 
-            if _block_msg is not None:
+            # Plan Mode gate + user-defined PreToolUse hook.
+            # The concurrent path runs these inside _invoke_tool; the
+            # sequential path historically inlined its own dispatch and
+            # skipped both, allowing single-tool turns to escape /plan
+            # lockdown and bypass PreToolUse hooks entirely.  Apply the
+            # same gates here so the lockdown / hook contracts hold for
+            # both batch and single-tool turns.
+            _seq_plan_refusal: Optional[str] = None
+            _seq_pre_block: Optional[str] = None
+            if _block_msg is None and _guardrail_block_decision is None:
+                _plan_mode_state = getattr(self, "_plan_mode", None)
+                if (_plan_mode_state is not None
+                        and _plan_mode_state.enabled
+                        and not _plan_mode_state.is_tool_allowed(
+                            function_name, args=function_args,
+                        )):
+                    _seq_plan_refusal = _plan_mode_state.refusal_for(function_name)
+                else:
+                    _seq_pre_outcome = self._fire_hook(
+                        "PreToolUse", tool=function_name, args=function_args,
+                    )
+                    if _seq_pre_outcome is not None:
+                        if _seq_pre_outcome.blocked:
+                            _seq_pre_block = (
+                                _seq_pre_outcome.block_reason
+                                or "blocked by PreToolUse hook"
+                            )
+                        elif _seq_pre_outcome.transformed_args is not None:
+                            function_args = _seq_pre_outcome.transformed_args
+
+            if _seq_plan_refusal is not None:
+                function_result = json.dumps(
+                    {"error": _seq_plan_refusal}, ensure_ascii=False,
+                )
+                tool_duration = 0.0
+            elif _seq_pre_block is not None:
+                function_result = json.dumps(
+                    {"error": _seq_pre_block}, ensure_ascii=False,
+                )
+                tool_duration = 0.0
+            elif _block_msg is not None:
                 # Tool blocked by plugin policy — return error without executing.
                 function_result = json.dumps({"error": _block_msg}, ensure_ascii=False)
                 tool_duration = 0.0
@@ -11698,6 +11771,14 @@ class AIAgent:
                         spinner.stop(cute_msg)
                     elif self._should_emit_quiet_tool_messages():
                         self._vprint(f"  {cute_msg}")
+            elif function_name == "orchestrate_tasks":
+                # Sequential dispatch path for the parallel-DAG tool —
+                # mirrors the concurrent branch.  parent_agent is
+                # threaded explicitly because registry.dispatch can't.
+                function_result = self._dispatch_orchestrate_tasks(function_args)
+                tool_duration = time.time() - tool_start_time
+                if self._should_emit_quiet_tool_messages():
+                    self._vprint(f"  {_get_cute_tool_message_impl('orchestrate_tasks', function_args, tool_duration, result=function_result)}")
             elif self._context_engine_tool_names and function_name in self._context_engine_tool_names:
                 # Context engine tools (lcm_grep, lcm_describe, lcm_expand, etc.)
                 spinner = None
@@ -11786,6 +11867,27 @@ class AIAgent:
                     function_result = f"Error executing tool '{function_name}': {tool_error}"
                     logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
                 tool_duration = time.time() - tool_start_time
+
+            # User-defined PostToolUse hook — fires after every
+            # sequential-path tool result is computed.  Mirrors the
+            # concurrent path's _invoke_tool wrapper.  Best-effort:
+            # errors are logged, result passes through unchanged so
+            # the model's view stays stable.
+            try:
+                _post_outcome = self._fire_hook(
+                    "PostToolUse",
+                    tool=function_name,
+                    args=function_args,
+                    result=function_result if isinstance(function_result, str)
+                    else str(function_result),
+                )
+                if _post_outcome is not None and _post_outcome.errors:
+                    logger.warning(
+                        "PostToolUse hook errors for %s: %s",
+                        function_name, "; ".join(_post_outcome.errors),
+                    )
+            except Exception:
+                pass
 
             if isinstance(function_result, str):
                 result_preview = function_result if self.verbose_logging else (

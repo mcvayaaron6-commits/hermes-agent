@@ -228,11 +228,20 @@ _TRUNC_SUFFIX = "... [truncated]"
 def _truncate(value: Any, limit: int = _MAX_FIELD_BYTES) -> Any:
     """Truncate large strings so the audit log doesn't balloon.
 
-    Final length is exactly ``limit`` — the suffix is included inside
-    the cap, not appended past it.
+    Final length is exactly ``limit`` — including when ``limit`` is
+    smaller than the suffix.  When the requested cap can't fit the
+    full suffix, we truncate the suffix itself so the result still
+    fits, rather than returning a string longer than the caller
+    asked for.
     """
     if isinstance(value, str) and len(value) > limit:
-        return value[: max(0, limit - len(_TRUNC_SUFFIX))] + _TRUNC_SUFFIX
+        if limit <= 0:
+            return ""
+        if limit >= len(_TRUNC_SUFFIX):
+            return value[: limit - len(_TRUNC_SUFFIX)] + _TRUNC_SUFFIX
+        # limit is shorter than the suffix — keep some marker but
+        # never exceed the cap.
+        return _TRUNC_SUFFIX[-limit:]
     if isinstance(value, dict):
         return {k: _truncate(v, limit) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
@@ -339,22 +348,68 @@ def write_event(
     except OSError as exc:
         logger.debug("audit: could not create log dir %s: %s", target.parent, exc)
         return False
+    # Default-on redaction — when audit.enabled is true, secrets in
+    # the data payload are scrubbed via the canonical
+    # agent.redact.redact_sensitive_text unless the caller passed an
+    # explicit redactor (typically None means "use default").  The
+    # docstring promises 'redacted via the same redactor that hook
+    # payloads use' — the prior implementation left this unwired,
+    # writing raw secrets to disk.  Operators can disable explicitly
+    # via security.redact_secrets: false in config.yaml.
+    if redactor is None:
+        try:
+            from agent.redact import redact_sensitive_text
+            try:
+                from hermes_cli.config import load_config
+                _sec_cfg = (load_config().get("security") or {})
+                _redact_on = bool(_sec_cfg.get("redact_secrets", True))
+            except Exception:
+                _redact_on = True
+            if _redact_on:
+                # Wrap to match the (text -> str) signature; the
+                # _apply_redactor helper handles string-or-nested-dict
+                # recursion downstream.
+                redactor = lambda s: redact_sensitive_text(s, force=False)
+        except Exception:
+            pass
     # Hash-chain + optional HMAC.  Per-file write lock ensures the
     # chain stays consistent under concurrent writers.
     key = _signing_key()
     try:
         with _WRITE_LOCK:
-            prev = _read_last_chain_state(target)
-            line = _format_line(
-                event,
-                session_id=session_id, data=data, agent=agent,
-                hermes_version=hermes_version, redactor=redactor,
-                prev_hash=prev, signing_key=key,
-            )
+            # Cross-process correctness: in-process _CHAIN_STATE cache
+            # can lie when another process has appended lines since we
+            # last read.  Take an OS-level exclusive flock on the file
+            # FOR THE ENTIRE read-tail + append critical section.  On
+            # platforms without fcntl (Windows native), we fall back
+            # to in-process cache only — operators should pin a single
+            # writer process in that case.
+            try:
+                import fcntl  # POSIX
+            except ImportError:
+                fcntl = None  # type: ignore[assignment]
             with target.open("a", encoding="utf-8") as fh:
+                if fcntl is not None:
+                    try:
+                        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+                    except OSError:
+                        pass  # filesystem may not support flock (NFS etc.)
+                # ALWAYS re-tail under the flock — the cache is per-
+                # process and can't see another process's appends.
+                # The tail-read is O(32KB) so this is fast.
+                _reset_chain_state(target)
+                prev = _read_last_chain_state(target)
+                line = _format_line(
+                    event,
+                    session_id=session_id, data=data, agent=agent,
+                    hermes_version=hermes_version, redactor=redactor,
+                    prev_hash=prev, signing_key=key,
+                )
                 fh.write(line)
                 fh.write("\n")
-            _update_chain_state(target, _line_hash(line))
+                fh.flush()
+                _update_chain_state(target, _line_hash(line))
+                # flock is released on fh.close() (with-exit).
     except OSError as exc:
         logger.debug("audit: write to %s failed: %s", target, exc)
         return False
