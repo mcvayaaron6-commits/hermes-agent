@@ -5250,12 +5250,19 @@ class HermesCLI:
                 print(f"    {event:<24} {count:>5}  {bar}")
             return
 
-        # Default: tail
-        try:
-            n = int(parts[2]) if len(parts) > 2 else 20
-        except ValueError:
+        # Default: tail.  Accept both `/audit 50` and `/audit tail 50`.
+        # Prior parsing relied on except-ValueError catching what was
+        # actually an IndexError, silently falling through to n=20.
+        n = 20
+        if sub.isdigit():
+            # `/audit 50` — the digit lives in parts[1].
             try:
-                n = int(parts[1]) if sub.isdigit() else 20
+                n = max(1, int(parts[1]))
+            except (ValueError, IndexError):
+                n = 20
+        elif sub == "tail" and len(parts) > 2:
+            try:
+                n = max(1, int(parts[2]))
             except (ValueError, IndexError):
                 n = 20
         events = audit_log.tail_events(n=n)
@@ -11336,13 +11343,30 @@ class HermesCLI:
                 # here, capture the delta as a lesson the agent can use
                 # next time.  Best-effort: never propagate failures.
                 if (result.get("verification", {}) or {}).get("status") == "VERIFIED":
+                    # Clear the executing_plan flag set by /exit-plan so
+                    # subsequent unrelated chat turns don't keep paying
+                    # for verifier LLM calls.  The plan executed
+                    # successfully; the auto_when_plan window closes.
+                    try:
+                        _pm = getattr(self.agent, "_plan_mode", None)
+                        if _pm is not None and getattr(_pm, "executing_plan", False):
+                            _pm.executing_plan = False
+                    except Exception:
+                        pass
                     prior_count = self._verification_rework_count
                     if prior_count > 0 and self._lessons_capture_buffer:
                         try:
                             from agent import lessons as _lessons
                             buf = self._lessons_capture_buffer
+                            # Guard the default — message may be None
+                            # on non-interactive code paths; eager
+                            # subscript would crash before .get returns
+                            # the stored task.
+                            _fallback_task = (message[:120]
+                                              if isinstance(message, str)
+                                              else "")
                             _lessons.capture_from_rework(
-                                task=buf.get("task", message[:120]),
+                                task=buf.get("task") or _fallback_task,
                                 initial_response=buf.get("initial_response", ""),
                                 needs_rework_summary=buf.get("rework_summary", ""),
                                 final_response=response,

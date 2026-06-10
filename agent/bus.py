@@ -401,8 +401,19 @@ def publish_agent_finished(agent_id: str, parent_agent_id: Optional[str],
 
 def publish_lesson_captured(lesson_path: str, task: str, tags: Iterable[str],
                              *, bus: Optional[Bus] = None) -> None:
+    # Use the lesson filename (stem) as the middle segment so pattern
+    # subscribers can match `lesson.*.captured` per the bus's
+    # documented hierarchical subject convention.  Falls back to a
+    # short uuid when the path is missing so the subject always has
+    # three segments.
+    from pathlib import Path as _P
+    if lesson_path:
+        _stem = _P(lesson_path).stem or "anonymous"
+    else:
+        import uuid as _uuid
+        _stem = "anon-" + _uuid.uuid4().hex[:8]
     (bus or get_bus()).publish(LessonCapturedEvent(
-        subject=f"lesson.captured",
+        subject=f"lesson.{_stem}.captured",
         lesson_path=lesson_path, task=task[:200], tags=tuple(tags),
     ))
 

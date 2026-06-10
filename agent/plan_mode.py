@@ -247,6 +247,13 @@ class PlanModeState:
     enabled: bool = False
     plan_path: Optional[Path] = None
     task: str = ""
+    #: Transient flag — set by ``exit()`` and consumed by the harness
+    #: on the first execution turn after ``/exit-plan``.  When True,
+    #: ``verification.auto_when_plan`` continues to fire so the plan's
+    #: execution is verified, BUT only for those execution turns —
+    #: cleared on first VERIFIED so subsequent unrelated chat doesn't
+    #: keep paying for verifier LLM calls.
+    executing_plan: bool = False
     allowlist: Set[str] = field(default_factory=lambda: set(DEFAULT_PLAN_MODE_ALLOWLIST))
     action_filters: dict[str, Set[str]] = field(
         default_factory=lambda: {k: set(v) for k, v in DEFAULT_PLAN_MODE_ACTION_FILTERS.items()}
@@ -256,16 +263,25 @@ class PlanModeState:
 
     def enter(self, *, task: str, plan_path: Path) -> None:
         self.enabled = True
+        self.executing_plan = False
         self.task = task
         self.plan_path = plan_path
 
     def exit(self) -> None:
         self.enabled = False
+        # Mark the just-exited session as in execution mode so the
+        # harness keeps auto_when_plan verification active until the
+        # plan executes to VERIFIED — at which point the harness
+        # clears this flag.  Without the flag, verification would
+        # fire for every unrelated chat turn until /new (the prior
+        # bug); with it, the verifier fires only during execution.
+        self.executing_plan = True
         # We intentionally keep plan_path / task around so callers that
         # need to read the artifact after exit (e.g. to seed todos) can.
 
     def reset(self) -> None:
         self.enabled = False
+        self.executing_plan = False
         self.task = ""
         self.plan_path = None
         self.extra_allow.clear()
@@ -293,9 +309,17 @@ class PlanModeState:
         return False
 
     def refusal_for(self, tool_name: str) -> str:
-        """Return the user-facing refusal string for a blocked tool."""
+        """Return the user-facing refusal string for a blocked tool.
+
+        Uses plain ``str.replace`` rather than ``str.format`` so a path
+        like ``/tmp/proj-{abc}/plan.md`` doesn't trip the format engine
+        into re-evaluating ``{abc}`` as a field reference (KeyError).
+        """
         plan_path = str(self.plan_path) if self.plan_path else ".hermes/plans/<plan>.md"
-        return PLAN_MODE_REFUSAL_TEMPLATE.format(tool=tool_name, plan_path=plan_path)
+        return (PLAN_MODE_REFUSAL_TEMPLATE
+                .replace("{tool!r}", repr(tool_name))
+                .replace("{tool}", str(tool_name))
+                .replace("{plan_path}", plan_path))
 
     # ------------------------------------------------------------------
     # Configuration helpers

@@ -304,10 +304,15 @@ def find_skill_candidates(
         except Exception as exc:
             logger.debug("could not load lessons: %s", exc)
             return []
-    threshold = threshold or _int_config("lesson_threshold", _DEFAULT_LESSON_THRESHOLD)
-    min_shared_tags = min_shared_tags or _int_config(
-        "min_shared_tags", _DEFAULT_MIN_SHARED_TAGS,
-    )
+    # `is None` rather than truthy — callers passing 0 explicitly to
+    # disable a gate would otherwise have their value silently
+    # replaced by the config default.
+    if threshold is None:
+        threshold = _int_config("lesson_threshold", _DEFAULT_LESSON_THRESHOLD)
+    if min_shared_tags is None:
+        min_shared_tags = _int_config(
+            "min_shared_tags", _DEFAULT_MIN_SHARED_TAGS,
+        )
 
     candidates: List[PromotionCandidate] = []
     clusters = _cluster_lessons_by_tag_overlap(
@@ -376,7 +381,8 @@ def find_profile_candidates_from_usage(
     body so we can carry the guidance forward; when absent, the
     profile body links back to the skill.
     """
-    threshold = threshold or _int_config("usage_threshold", _DEFAULT_USAGE_THRESHOLD)
+    if threshold is None:
+        threshold = _int_config("usage_threshold", _DEFAULT_USAGE_THRESHOLD)
     skill_bodies = skill_bodies or {}
     out: List[PromotionCandidate] = []
     for skill_name, uses in skill_usage.items():

@@ -253,6 +253,19 @@ class Orchestrator:
                         continue
                     spec = by_id[tid]
                     dep_states = [state[d] for d in spec.depends_on]
+                    # Promotion is "all deps reached a terminal state."
+                    # If all SUCCEEDED, READY.  If any FAILED/SKIPPED
+                    # and requires_upstream_success=True, SKIP.  If any
+                    # FAILED/SKIPPED but requires_upstream_success=False,
+                    # the task should STILL run (it's a cleanup/post-
+                    # mortem task) — promote to READY as soon as every
+                    # dep has reached a terminal state (SUCCEEDED,
+                    # FAILED, or SKIPPED).  The prior code only checked
+                    # all-SUCCEEDED, stranding cleanup tasks PENDING
+                    # forever.
+                    _terminal_deps = {
+                        TaskState.SUCCEEDED, TaskState.FAILED, TaskState.SKIPPED,
+                    }
                     if all(d is TaskState.SUCCEEDED for d in dep_states):
                         state[tid] = TaskState.READY
                     elif any(
@@ -264,6 +277,10 @@ class Orchestrator:
                                 task_id=tid, state=TaskState.SKIPPED,
                                 error="upstream dependency failed or was skipped",
                             )
+                        elif all(d in _terminal_deps for d in dep_states):
+                            # All deps terminal AND we don't require
+                            # success — promote so the task runs.
+                            state[tid] = TaskState.READY
 
                 # 2. Submit ready tasks up to fanout capacity.
                 for tid, st in list(state.items()):

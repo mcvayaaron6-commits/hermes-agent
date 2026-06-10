@@ -187,7 +187,14 @@ def test_upstream_failure_skips_downstream():
 
 
 def test_requires_upstream_success_false_still_runs():
-    def fail_a(spec, prior):
+    """A task with requires_upstream_success=False must run even when
+    upstream failed — that's the whole point of the flag.  Before the
+    fix this stranded the task PENDING forever; now it's promoted to
+    READY as soon as every dep reaches a terminal state."""
+    executed = []
+
+    def fail_a_track_cleanup(spec, prior):
+        executed.append(spec.id)
         if spec.id == "a":
             return TaskResult(task_id=spec.id, state=TaskState.FAILED,
                               error="boom")
@@ -198,15 +205,51 @@ def test_requires_upstream_success_false_still_runs():
         TaskSpec(id="cleanup", goal="cleanup", depends_on=["a"],
                  requires_upstream_success=False),
     ]
-    orch = Orchestrator(fail_a)
+    orch = Orchestrator(fail_a_track_cleanup)
     result = orch.run(tasks)
-    # cleanup is still attempted despite a failing.
-    # Note: cleanup will fail because a failed, but it WILL run.
-    # Actually — looking at the code, requires_upstream_success=False
-    # currently means the task is NOT auto-skipped, but it also won't
-    # be promoted to READY unless all deps SUCCEEDED in current impl.
-    # This test documents the current behaviour.
     assert result.task("a").state is TaskState.FAILED
+    # The cleanup MUST have executed and succeeded.
+    assert "cleanup" in executed
+    assert result.task("cleanup").state is TaskState.SUCCEEDED
+    # The overall result is failed (because A failed) but cleanup
+    # got its chance.
+    assert not result.succeeded
+
+
+def test_requires_upstream_success_false_waits_for_terminal_state():
+    """Cleanup task waits for ALL deps to reach terminal state before
+    promoting — doesn't run prematurely on partial completion."""
+    import threading
+    block_a = threading.Event()
+    executed_order = []
+
+    def slow_a_then_cleanup(spec, prior):
+        executed_order.append(spec.id)
+        if spec.id == "a":
+            block_a.wait(timeout=2.0)
+            return TaskResult(task_id=spec.id, state=TaskState.FAILED,
+                              error="boom")
+        return TaskResult(task_id=spec.id, state=TaskState.SUCCEEDED)
+
+    tasks = [
+        TaskSpec(id="a", goal="A"),
+        TaskSpec(id="cleanup", goal="cleanup", depends_on=["a"],
+                 requires_upstream_success=False),
+    ]
+    orch = Orchestrator(slow_a_then_cleanup, fanout=2)
+
+    import time
+    def release():
+        time.sleep(0.1)
+        block_a.set()
+    t = threading.Thread(target=release)
+    t.start()
+    result = orch.run(tasks)
+    t.join()
+
+    # cleanup must come after a finished, not interleaved.
+    assert executed_order[0] == "a"
+    assert "cleanup" in executed_order[1:]
 
 
 def test_executor_raises_becomes_failed():
